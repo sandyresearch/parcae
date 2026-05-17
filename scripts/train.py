@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from parcae_lm.models.config import ParcaeConfig
+from parcae_lm.models.parcae import ParcaeConfig
 from parcae_lm.tokenizer import Tokenizer
 
 global_start_time = time.time()
@@ -823,9 +823,9 @@ def train(fabric, state, cfg):
             fabric.barrier()
 
             if torch.distributed.is_initialized() and (state["microbatch_step"] % 32) == 0:
-            exit_tensor = torch.as_tensor([int(state["should_exit_training"])], device=fabric.device)
-            torch.distributed.all_reduce(exit_tensor, torch.distributed.ReduceOp.MIN, async_op=False)
-            state["should_exit_training"] = bool(exit_tensor.item())  # always cast back to bool
+                exit_tensor = torch.as_tensor([int(state["should_exit_training"])], device=fabric.device)
+                torch.distributed.all_reduce(exit_tensor, torch.distributed.ReduceOp.MIN, async_op=False)
+                state["should_exit_training"] = bool(exit_tensor.item())  # always cast back to bool
 
         # Log at an interval.
         if step % cfg.log_step_interval == 0 or (state["should_exit_training"] and (step % 32) == 0):

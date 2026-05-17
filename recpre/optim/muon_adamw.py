@@ -37,7 +37,7 @@ def muon_step(g: Tensor, p: Tensor, m: Tensor, v: Tensor, mom: Tensor, lr: Tenso
     b2_f = b2.to(g.dtype)
     v_mean = g.float().square().mean(dim=rd, keepdim=True)
     v_norm = (v_mean.sum(dim=(-2, -1), keepdim=True) * g.size(rd)).sqrt()
-    v.lerp_(v_mean.to(v.dtype), 1 - b2_f)
+    v.lerp_(v_mean.to(v.dtype), (1 - b2_f).to(v.dtype))
     scale = v.clamp_min(1e-10).rsqrt()
     v_new = ((v_mean * g.size(rd)) * scale.float().square()).sum(dim=(-2, -1), keepdim=True).sqrt()
     g = g * (scale * (v_norm / v_new.clamp_min(1e-10))).to(g.dtype)

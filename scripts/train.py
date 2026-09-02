@@ -47,7 +47,12 @@ from recpre.settings import CLISettings
 from recpre.schedulers import get_lr_scheduler
 
 from recpre.huggingface_dataset import HuggingfaceDataset, ParquetStream, ParquetStreamPure, RandomTokensDataset
-from recpre.data_loading_utils import generic_collate_fn, BestFitPackingCollator
+from recpre.data_loading_utils import (
+    generic_collate_fn,
+    BestFitPackingCollator,
+    PackedIterableDataset,
+    unwrap_singleton_collate,
+)
 import recpre.utils
 from recpre.data_scheduler_utils import DataSchedulerTracker, DataScheduler
 from recpre.monitor import (
@@ -1032,8 +1037,10 @@ def create_dataloader(
         data_scheduler_tracker = None
 
     packing_collator = None
+    loader_batch_size = batch_size
     if cfg.pack_sequences:
-        # Use BOS-aligned best-fit packing (nanochat-style) for 100% utilization
+        # Pull enough documents to keep the best-fit buffer full while emitting
+        # exactly one configured microbatch per dataloader item.
         packing_collator = BestFitPackingCollator(
             tokenizer=tokenizer,
             block_size=cfg.loader_block_size,
@@ -1041,7 +1048,9 @@ def create_dataloader(
             add_eos=cfg.add_eos,
             buffer_size=cfg.pack_buffer_size,
         )
-        parametrized_collate_fn = packing_collator
+        combined_dataset = PackedIterableDataset(combined_dataset, packing_collator, n_rows=batch_size)
+        parametrized_collate_fn = unwrap_singleton_collate
+        loader_batch_size = 1
     else:
         parametrized_collate_fn = partial(
             generic_collate_fn,
@@ -1058,7 +1067,7 @@ def create_dataloader(
     return (
         loader_class(
             combined_dataset,
-            batch_size=batch_size,
+            batch_size=loader_batch_size,
             shuffle=False,
             pin_memory=True,
             collate_fn=parametrized_collate_fn,
@@ -1381,7 +1390,11 @@ def load_checkpoint(fabric, state, out_dir, run_name, model_checkpoint, resume=T
                                  f"buffer_size={len(packing_collator.doc_buffer)}")
                 else:
                     fabric.print(f"WARNING: Unknown packing_collator format: {type(pc_saved)}")
-                if hasattr(state["train_dataloader"], 'collate_fn'):
+                dataset = getattr(state["train_dataloader"], "dataset", None)
+                if isinstance(dataset, PackedIterableDataset):
+                    dataset.collator = packing_collator
+                    fabric.print("  Updated dataset collator to restored collator")
+                elif hasattr(state["train_dataloader"], 'collate_fn'):
                     state["train_dataloader"].collate_fn = packing_collator
                     fabric.print(f"  Updated dataloader collate_fn to restored collator")
             if packing_collator is not None:

@@ -1,6 +1,8 @@
+import copy
 import torch
 
 from typing import Optional, List
+from torch.utils.data import IterableDataset, get_worker_info
 from torch.utils.data._utils.collate import collate_tensor_fn
 from parcae_lm.tokenizer import Tokenizer
 
@@ -33,23 +35,28 @@ class BestFitPackingCollator:
             return
         doc_buffer_lists = state_dict.get("doc_buffer", [])
         self.doc_buffer = [torch.tensor(doc, dtype=torch.long) for doc in doc_buffer_lists]
-    
-    def __call__(self, batch) -> tuple[torch.Tensor, torch.Tensor, list]:
-        for row in batch:
+
+    def _refill(self, doc_iter) -> None:
+        while len(self.doc_buffer) < self.buffer_size:
+            try:
+                row = next(doc_iter)
+            except StopIteration:
+                return
             tokens = self._tokenize_row(row)
             if tokens is not None and len(tokens) > 0:
                 self.doc_buffer.append(tokens)
-        
-        batch_size = len(batch)
-        row_buffer = torch.empty((batch_size, self.row_capacity), dtype=torch.long)
-        
-        for row_idx in range(batch_size):
+
+    def _emit(self, n_rows: int, doc_iter=None) -> tuple[torch.Tensor, torch.Tensor, list]:
+        row_buffer = torch.empty((n_rows, self.row_capacity), dtype=torch.long)
+        for row_idx in range(n_rows):
             pos = 0
             while pos < self.row_capacity:
+                if doc_iter is not None:
+                    self._refill(doc_iter)
                 if not self.doc_buffer:
                     row_buffer[row_idx, pos:] = self.tokenizer.pad_id or 0
                     break
-                
+
                 remaining = self.row_capacity - pos
                 best_idx = -1
                 best_len = 0
@@ -58,7 +65,7 @@ class BestFitPackingCollator:
                     if doc_len <= remaining and doc_len > best_len:
                         best_idx = i
                         best_len = doc_len
-                
+
                 if best_idx >= 0:
                     doc = self.doc_buffer.pop(best_idx)
                     row_buffer[row_idx, pos:pos + len(doc)] = doc
@@ -68,13 +75,19 @@ class BestFitPackingCollator:
                     doc = self.doc_buffer.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = doc[:remaining]
                     pos += remaining
-        
+
         input_ids = row_buffer[:, :-1].contiguous()
         label_ids = row_buffer[:, 1:].contiguous()
-        
-        metadata = [None] * batch_size
+        metadata = [None] * n_rows
         return input_ids, label_ids, metadata
-    
+
+    def __call__(self, batch) -> tuple[torch.Tensor, torch.Tensor, list]:
+        for row in batch:
+            tokens = self._tokenize_row(row)
+            if tokens is not None and len(tokens) > 0:
+                self.doc_buffer.append(tokens)
+        return self._emit(len(batch))
+
     def _tokenize_row(self, row) -> Optional[torch.Tensor]:
         if isinstance(row, torch.Tensor):
             return row
@@ -100,6 +113,50 @@ class BestFitPackingCollator:
                     return self.tokenizer.encode(text, bos=local_add_bos, eos=local_add_eos)
         
         return None
+
+
+class PackedIterableDataset(IterableDataset):
+    """Pull documents on demand so the packing buffer stays full."""
+
+    def __init__(self, dataset, collator: BestFitPackingCollator, n_rows: int):
+        super().__init__()
+        self.dataset = dataset
+        self.collator = collator
+        self.n_rows = n_rows
+
+    def __iter__(self):
+        collator = self.collator
+        if get_worker_info() is not None:
+            collator = copy.copy(self.collator)
+            collator.doc_buffer = []
+        doc_iter = iter(self.dataset)
+        while True:
+            collator._refill(doc_iter)
+            if not collator.doc_buffer:
+                return
+            yield collator._emit(self.n_rows, doc_iter=doc_iter)
+
+    def __getattr__(self, name):
+        try:
+            dataset = object.__getattribute__(self, "dataset")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(dataset, name)
+
+    @property
+    def _state(self):
+        dataset = object.__getattribute__(self, "dataset")
+        if not hasattr(dataset, "_state"):
+            raise AttributeError("_state")
+        return dataset._state
+
+    @_state.setter
+    def _state(self, value):
+        object.__getattribute__(self, "dataset")._state = value
+
+
+def unwrap_singleton_collate(batch):
+    return batch[0]
 
 
 def pass_text(row, tokenizer, add_bos, add_eos):

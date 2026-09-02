@@ -150,6 +150,10 @@ class ParquetStreamPure(IterableDataset):
         if broadcast_glob and torch.distributed.is_initialized():
             if process_rank == 0:
                 filenames = sorted(str(p) for p in Path(dataset_folder_path).rglob(f"{prefix}*.parquet"))
+                if shuffle_filenames:
+                    # Stride slicing partitions files only when every rank
+                    # receives the same filename permutation.
+                    random.Random(seed).shuffle(filenames)
             else:
                 filenames: list[str] = None  # type: ignore
             obj = [filenames]
@@ -157,8 +161,8 @@ class ParquetStreamPure(IterableDataset):
             parquet_files = obj[0]
         else:
             parquet_files = sorted(str(p) for p in Path(dataset_folder_path).rglob(f"{prefix}*.parquet"))
-        if shuffle_filenames:
-            random.Random(seed).shuffle(parquet_files)
+            if shuffle_filenames:
+                random.Random(seed).shuffle(parquet_files)
 
         # Shard files for distributed training
         if plan_for_later_rank_expansion_to > 0:

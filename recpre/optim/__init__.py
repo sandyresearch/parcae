@@ -14,6 +14,16 @@ from .soap import SOAP
 from .muon_adamw import MuonAdamW, get_muon_param_groups
 
 
+def compute_scaled_muon_wd(optim_config, d_model):
+    """nanochat-style 1/channels² Muon WD scaling. Reference d_model is 768 (parcae-small).
+    Set optim_config['muon_wd_dmodel_scale']=false to disable."""
+    base = optim_config.get('muon_wd', 0.0)
+    if not optim_config.get('muon_wd_dmodel_scale', True):
+        return base
+    d_ref = optim_config.get('muon_wd_dmodel_ref', 768)
+    return base * (d_ref / d_model) ** 2
+
+
 def get_muon_param_groups_from_config(named_parameters, optim_config, no_weight_decay_for_bias_and_norm_params=True, verbose=False):
     """Build MuonAdamW param groups from standard optim_config."""
     return get_muon_param_groups(

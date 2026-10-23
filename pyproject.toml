@@ -30,6 +30,8 @@ dependencies = [
   "packaging",
   "ninja",
   "torchdata",
+  "liger-kernel==0.8.0",
+  "flash-linear-attention[cuda]==0.5.2",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +65,14 @@ quant = [
   "scipy",
 ]
 
+# SGLang serving (sglang_parcae)
+sglang = [
+  "sglang[all]==0.5.14",
+]
+
+[project.scripts]
+parcae-sglang-serve = "sglang_parcae.register:main"
+
 [tool.setuptools.packages.find]
 include = [
     "parcae_lm",
@@ -71,6 +81,8 @@ include = [
     "recpre.*",
     "receval",
     "receval.*",
+    "sglang_parcae",
+    "sglang_parcae.*",
 ]
 exclude = []
 

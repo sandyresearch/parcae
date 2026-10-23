@@ -9,7 +9,7 @@ PROJECT_DIR="${PROJECT_DIR:-/data/$USER/parcae-pr}"     # Host path to this repo
 DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/sandyresearch/parcae:sha-49c27cb}"
 # =============================================================================
 
-CONFIG="${CONFIG:-launch_configs/parcae-small-140m.yaml}"
+CONFIG="${CONFIG:-launch_configs/parcae/pretrain/parcae-small-140m.yaml}"
 DATA_DIR="/resource/data"
 
 echo "Setting up interactive environment..."

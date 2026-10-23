@@ -1,9 +1,9 @@
-run_name: parcae-medium-370m
+run_name: parcae-140m-mla
 resume: False
-# max_tokens: 29_600_000_000
+max_tokens: 11_200_000_000
 seed: 42
-out_dir: "outputs/parcae-medium-370m"
-model_name: parcae-medium-370m
+out_dir: "outputs/parcae-140m-mla"
+model_name: parcae-140m-mla
 model_impl: dynamic
 block_size: 2048
 
@@ -13,19 +13,20 @@ partial_depth_eval: [1, 2, 4]
 model_overwrite:
   vocab_size: 32768
   prelude_norm: true
+  use_fused_head: liger
 
 world_batch_size: 256
-micro_batch_size: 16
+micro_batch_size: 32
 
 optimizer: MuonAdamW
 optim_config:
-  lr: 8e-3
-  weight_decay: 0.0
+  lr: 2e-2
+  weight_decay: 0.1
   betas: [0.8, 0.95]
   eps: 1e-10
-  muon_lr: 8e-3
+  muon_lr: 2e-2
   muon_momentum: 0.95
-  muon_wd: 0.2
+  muon_wd: 0.3         # Muon weight decay (cautious, linearly decays to 0)
   muon_ns_steps: 5
 
 warmup_steps: 0.0
@@ -53,8 +54,8 @@ allow_nonfinite_loss: False
 logger_project: "parcae"
 model_telemetry: True
 log_step_interval: 1
-save_step_interval: 2048
-eval_step_interval: 1024
+save_step_interval: 1024
+eval_step_interval: 512
 eval_iters: 16
 save_last_step: True
 
@@ -66,16 +67,15 @@ data_config:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/train"
+      data_dir: "/resource/data/climbmix-shuffle/400b"
       data_signature:
         keys: ["text"]
   val_data:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/val"
+      data_dir: "/resource/data/climbmix-shuffle/val"
       data_signature:
         keys: ["text"]
 
-tokenizer_path: "/resource/tokenizer/parcae_tokenizer"
-
+tokenizer_path: "SandyResearch/parcae-climbmix-tokenizer"

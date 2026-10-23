@@ -142,6 +142,49 @@ def track_gradient_metrics(model, optimizer, metrics):
     metrics |= optim_metrics
 
 
+# Bucket parameter grad norms by submodule for grad-spike attribution (block / attn|mlp|norm / param).
+def _spike_bucket_key(parts: list[str]) -> str:
+    for i, p in enumerate(parts):
+        if p in ("core_block", "prelude", "coda") and i + 1 < len(parts):
+            block = f"{p}.{parts[i + 1]}"
+            rest = parts[i + 2:]
+            if len(rest) >= 2 and rest[0] == "attn":
+                return f"{block}.attn.{rest[1]}"
+            if len(rest) >= 2 and rest[0] == "mlp":
+                return f"{block}.mlp.{rest[1]}"
+            if rest and rest[0].startswith("norm"):
+                return f"{block}.{rest[0]}"
+            return block
+        if p == "adapter":
+            return f"adapter.{parts[i + 1]}" if i + 1 < len(parts) else "adapter"
+        if p == "C":
+            return "C"
+        if p in ("wte", "lm_head", "embedding"):
+            return "embedding"
+        if p == "ln_f":
+            return "norm"
+    return "other"
+
+
+@torch.no_grad()
+def compute_grad_norm_buckets(model):
+    buckets: dict[str, list] = {}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        clean = name
+        for prefix in ("_orig_mod.", "_forward_module.", "_fsdp_wrapped_module.", "module."):
+            clean = clean.replace(prefix, "")
+        key = _spike_bucket_key(clean.split("."))
+        buckets.setdefault(key, []).append(param.grad.detach().norm())
+    bucket_norms = [(k, torch.stack(v).norm()) for k, v in buckets.items()]
+    total_sq = sum(n.item() ** 2 for _, n in bucket_norms)
+    if total_sq > 0:
+        bucket_norms = [(k, n, n.item() / total_sq**0.5) for k, n in bucket_norms]
+        return bucket_norms
+    return [(k, n, 0.0) for k, n in bucket_norms]
+
+
 def _get_num_params(model: torch.nn.Module, only_trainable: bool = False) -> int:
     """
     Get the total model params
@@ -205,8 +248,9 @@ def _estimate_num_flop_per_token(num_params: int, model_config, model=None) -> i
             model_config.head_size,
         )
         flop_per_token = 6 * num_params + 12 * l * h * q * t
-    
-    return flop_per_token * 3  # 1 fwd + 2 bwd
+
+    # `6 * params` and `12 * l * h * q * t` already count forward and backward.
+    return flop_per_token
 
 
 def _actually_measure_flops(model_config, objective, gradient_checkpointing, micro_batch_size=1) -> int:
@@ -223,12 +267,12 @@ def _actually_measure_flops(model_config, objective, gradient_checkpointing, mic
             config_copy._recurrent_block_config.simple_ops = True
             config_copy._recurrent_block_config.use_fused_head = False
         
-        # Use FakeTensorMode for proper FLOP counting (meta tensors don't support all ops)
+        # Use FakeTensorMode for proper FLOP counting (meta tensors don't support all ops).
+        # Build the input on meta, the model's device, so FakeTensorMode does not fall back to the estimator.
         with FakeTensorMode(allow_non_fake_inputs=True):
             with torch.device("meta"):
                 meta_model = config_copy.construct_model(objective=objective, gradient_checkpointing=gradient_checkpointing)
-            # Create input on CPU (FakeTensorMode will convert it)
-            x = torch.randint(0, config_copy.padded_vocab_size, (micro_batch_size, model_config.block_size))
+                x = torch.randint(0, config_copy.padded_vocab_size, (micro_batch_size, model_config.block_size))
 
             flop_counter = FlopCounterMode(display=not torch.distributed.is_initialized())
             with flop_counter:
@@ -236,10 +280,12 @@ def _actually_measure_flops(model_config, objective, gradient_checkpointing, mic
             measured_flops = flop_counter.get_total_flops()
             del meta_model, x
     except (NotImplementedError, AssertionError, RuntimeError) as e:
-        print(
-            "Cannot trace model with meta tensors for flop calculation, falling back on estimated flop count. "
-            f"This may be (very) inaccurate for exotic archs. Original error: {e}"
-        )
+        _rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if _rank0:
+            print(
+                "Cannot trace model with meta tensors for flop calculation, falling back on estimated flop count. "
+                f"This may be (very) inaccurate for exotic archs. Original error: {e}"
+            )
         with torch.device("meta"):
             meta_model = model_config.construct_model(
                 objective=objective, gradient_checkpointing=gradient_checkpointing
@@ -249,7 +295,8 @@ def _actually_measure_flops(model_config, objective, gradient_checkpointing, mic
         # (it will divide by block_size), so multiply here to match the traced path
         flops_per_token = _estimate_num_flop_per_token(num_params, model_config, model=meta_model)
         measured_flops = flops_per_token * model_config.block_size
-        print(f"FLOP estimate for this model is {measured_flops:,} ({flops_per_token:,} per token)")
+        if _rank0:
+            print(f"FLOP estimate for this model is {measured_flops:,} ({flops_per_token:,} per token)")
     return measured_flops
 
 

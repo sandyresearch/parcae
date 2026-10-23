@@ -4,7 +4,6 @@ import torch
 from torch import Tensor
 
 from parcae_lm.models.config import AnyConfig
-from parcae_lm.modules.mixer import CausalSelfAttention
 
 
 class TransformerPreNormBlock(torch.nn.Module):
@@ -14,7 +13,7 @@ class TransformerPreNormBlock(torch.nn.Module):
         super().__init__()
         self.config = config
         self.norm_1 = config.Norm(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config, layer_id=layer_id)
+        self.attn = config.Attention(config, layer_id=layer_id)
         self.norm_2 = config.Norm(config.n_embd, eps=config.norm_eps)
         self.mlp = config.MLP(config, layer_id=layer_id)
         self.layer_id = layer_id

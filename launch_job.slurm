@@ -32,7 +32,7 @@ echo "Nodes: ${SLURM_NNODES}"
 echo "Node list: ${SLURM_NODELIST}"
 echo "=============================================="
 
-CONFIG="${CONFIG:-launch_configs/parcae-large-770m.yaml}"
+CONFIG="${CONFIG:-launch_configs/parcae/pretrain/parcae-large-770m.yaml}"
 RUN_NAME="${RUN_NAME:-parcae-multinode-${SLURM_JOB_ID}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 SWEEP_SCRIPT="${SWEEP_SCRIPT:-}"

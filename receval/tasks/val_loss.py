@@ -44,7 +44,10 @@ def run_val_loss(model, tokenizer, settings, val_texts: list[str], max_samples: 
     total_tokens = 0
     samples_processed = 0
     model.eval()
-    pbar = tqdm(val_texts[:max_samples], desc="val_loss", disable=settings.ddp_rank != 0)
+    selected_texts = val_texts[:max_samples]
+    if settings.ddp_world_size > 1:
+        selected_texts = selected_texts[settings.ddp_rank::settings.ddp_world_size]
+    pbar = tqdm(selected_texts, desc="val_loss", disable=settings.ddp_rank != 0)
     for text in pbar:
         tokens = tokenizer.encode(text, return_tensors=False)
         if not isinstance(tokens, list):

@@ -1,0 +1,80 @@
+run_name: gpt-xlarge-1_3b
+resume: True
+max_tokens: 104_000_000_000
+seed: 42
+out_dir: "outputs/gpt-xlarge-1_3b"
+model_name: gpt-xlarge-1_3b
+model_impl: dynamic
+block_size: 2048
+
+model_overwrite:
+  vocab_size: 32768
+
+world_batch_size: 256
+micro_batch_size: 16
+
+# MuonAdamW: Muon for 2D weights, AdamW for embeddings/norms
+optimizer: MuonAdamW
+optim_config:
+  lr: 6e-3              # AdamW base LR (embeddings, norms)
+  weight_decay: 0.0     # AdamW weight decay (nanochat: 0 for embeddings/norms)
+  betas: [0.8, 0.95]    # AdamW betas
+  eps: 1e-10            # AdamW eps
+  muon_lr: 8e-3         # Muon LR for 2D weights
+  muon_momentum: 0.95   # Muon Nesterov momentum
+  muon_wd: 0.2         # Muon weight decay (cautious, linearly decays to 0)
+  muon_ns_steps: 5      # Polar Express iterations
+
+warmup_steps: 0.0
+cooldown_steps: 0.5
+lr_schedule: trapezoid
+min_lr: 0
+grad_clip: 1.0
+no_weight_decay_for_bias_and_norm_params: True
+
+z_regularization: 0
+label_smoothing: 0
+
+fabric_strategy: ddp
+fabric_precision: bf16-mixed
+fabric:
+  optim_sharding: False
+
+compile_model: True
+gradient_checkpointing: False
+
+loss_guardrail_active: False
+skip_nonfinite_grads: False
+allow_nonfinite_loss: False
+
+logger_project: "parcae"
+model_telemetry: True
+log_step_interval: 1
+save_step_interval: 4096
+eval_step_interval: 4096
+eval_iters: 16
+save_last_step: True
+
+all_block_size_tensors: False
+pack_sequences: True
+
+data_config:
+  train_data:
+    - type: pqds-pure
+      prefix: ""
+      weight: 1
+      data_dir: "/resource/data/fineweb-edu-shuffled/data/sample-350BT/train"
+      data_signature:
+        keys: ["text"]
+  val_data:
+    - type: pqds-pure
+      prefix: ""
+      weight: 1
+      data_dir: "/resource/data/fineweb-edu-shuffled/data/val/train"
+      data_signature:
+        keys: ["text"]
+
+tokenizer_path: "SandyResearch/parcae-tokenizer"
+
+
+

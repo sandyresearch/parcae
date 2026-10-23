@@ -46,6 +46,22 @@ class CoreTaskSettings:
 class CoreExtendedTaskSettings:
     max_per_task: int = -1
     seeds: list[int] = field(default_factory=lambda: [1234])
+    strategies: list[str] = field(default_factory=lambda: ["full"])
+
+
+@dataclass
+class KVCacheTaskSettings:
+    max_per_task: int = -1
+    seeds: list[int] = field(default_factory=lambda: [1234])
+    strategies: list[str] = field(default_factory=lambda: ["full", "compress-s1"])
+
+
+@dataclass
+class KVCacheValTaskSettings:
+    val_data_dir: Optional[str] = None
+    max_samples: int = 1000
+    max_files: int = 5
+    strategies: list[str] = field(default_factory=lambda: ["full", "compress-s1"])
 
 
 @dataclass
@@ -55,6 +71,24 @@ class TaskSettings:
     bpb: BPBTaskSettings = field(default_factory=BPBTaskSettings)
     core: CoreTaskSettings = field(default_factory=CoreTaskSettings)
     core_extended: CoreExtendedTaskSettings = field(default_factory=CoreExtendedTaskSettings)
+    kv_cache: KVCacheTaskSettings = field(default_factory=KVCacheTaskSettings)
+    kv_cache_val: KVCacheValTaskSettings = field(default_factory=KVCacheValTaskSettings)
+
+
+@dataclass
+class SGLangSettings:
+    dp_size: int = 8
+    tp_size: int = 1
+    host: str = "127.0.0.1"
+    port: int = 30000
+    mode: Literal["exact", "turbo"] = "exact"
+    shim_root: Optional[str] = None
+    tokenizer_path: Optional[str] = None
+    state_init: str = "zero"
+    t_max: Optional[int] = None
+    context_length: int = 2055
+    server_timeout_s: float = 900
+    request_timeout_s: float = 600
 
 
 @dataclass
@@ -69,7 +103,9 @@ class CLISettings:
     device_type: str = ""
     precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     device_batch_size: int = 32
+    eval_backend: Literal["local", "sglang"] = "local"
     tasks: TaskSettings = field(default_factory=TaskSettings)
+    sglang: SGLangSettings = field(default_factory=SGLangSettings)
     override_mean_recurrence: Optional[int] = None  # Override recurrence depth for parcae models
     run_name: Optional[str] = field(init=False, default=None)
     model_name: Optional[str] = field(init=False, default=None)
@@ -88,7 +124,7 @@ class CLISettings:
             self._load_from_run_dir()
         self.run_name = self.run_name or f"eval-{Path(self.out_dir).name}"
         self.eval_task_list = [t.strip() for t in self.eval_tasks.split(",")]
-        valid_tasks = {"lm_eval", "bpb", "sample", "core", "core_extended"}
+        valid_tasks = {"lm_eval", "bpb", "sample", "core", "core_extended", "kv_cache", "kv_cache_val"}
         invalid = set(self.eval_task_list) - valid_tasks
         if invalid:
             raise ValueError(f"Invalid eval tasks: {invalid}. Valid: {valid_tasks}")
@@ -108,7 +144,7 @@ class CLISettings:
             if cfg_path.exists():
                 self._load_config(cfg_path)
                 break
-        if self.checkpoint_path is None:
+        if self.checkpoint_path is None and self.hf_repo is None:
             self.checkpoint_path = self._find_checkpoint(run_dir, self.step)
 
     def _load_config(self, cfg_path: Path):

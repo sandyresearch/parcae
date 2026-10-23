@@ -1,14 +1,22 @@
 <h1 align="center" style="fontsize:50em"><b>Parcae</b></h1>
 
-![Parcae](assets/main_fig-1.png "Parcae Looped Architecture")
+![Parcae](assets/parcae.png "Parcae Looped Architecture")
 > **Parcae: Scaling Laws For Stable Looped Language Models**\
 > Hayden Prairie, Zachary Novack, Taylor Berg-Kirkpatrick, Daniel Y. Fu\
 > Paper: https://arxiv.org/abs/2604.12946
 
 
-# About
+![BeNice!](assets/benice.png "KV-Sharing Across Recurrences")
+> **BeNice! Closing Looping's Inference-Memory Gap via KV-Sharing**\
+> Hayden Prairie<sup>&ast;</sup>, Jacob M. Ryan<sup>&ast;</sup>, Taylor Berg-Kirkpatrick, Daniel Y. Fu\
+> Paper:  https://arxiv.org/abs/2610.31633v1
+
+
+# About this Codebase
 
 Parcae is a new looped architecture that utilizes a handful of techniques to stabilize training. Parcae enables stable, hassle-free training of looped models, which we use to derive the first scaling laws for looping, finding that compute-optimal training scales looping and data in tandem.
+
+BeNice! is a post-training technique that allows looped architectures to share KV-caches across recurrence with no quality degradations, a property we call *KV-shareability*. BeNice! allows looped architectures to maintain the same memory footprint as their unlooped counterparts.
 
 # Installation
 
@@ -32,7 +40,7 @@ Our launch scripts handle everything automatically. Set `PROJECT_DIR` and `DOCKE
 bash launch_interactive.sh
 
 # Submit a training job
-CONFIG=launch_configs/parcae-small-140m.yaml sbatch launch_job.slurm
+CONFIG=launch_configs/parcae/pretrain/parcae-small-140m.yaml sbatch launch_job.slurm
 ```
 
 The Docker image is hosted publicly at `ghcr.io/sandyresearch/parcae` and will be pulled automatically.
@@ -74,6 +82,8 @@ model = config.construct_model()
 python scripts/download_data.py fineweb-100bt   # FineWeb-Edu 100B tokens
 python scripts/download_data.py fineweb-350bt   # FineWeb-Edu 350B tokens
 python scripts/download_data.py huginn          # Huginn dataset
+python scripts/download_data.py climbmix-100bt  # ClimbMix 100B tokens
+python scripts/download_data.py climbmix-400bt  # ClimbMix 400B tokens
 ```
 
 ### Training a Tokenizer
@@ -92,29 +102,26 @@ python scripts/tok_eval.py --tokenizer tokenizer/parcae_tokenizer --data-dir fin
 
 ### Launching Training
 
-Training is configured via YAML files in `launch_configs/`. Available configs:
-
-| Config | Architecture | Parameters |
-|--------|-------------|------------|
-| `parcae-small-140m.yaml` | Parcae | 140M |
-| `parcae-medium-370m.yaml` | Parcae | 370M |
-| `parcae-large-770m.yaml` | Parcae | 770M |
-| `parcae-xlarge-1_3b.yaml` | Parcae | 1.3B |
-| `gpt-small-140m.yaml` | GPT | 140M |
-| `gpt-medium-370m.yaml` | GPT | 370M |
-| `gpt-large-770m.yaml` | GPT | 770M |
-| `gpt-xlarge-1_3b.yaml` | GPT | 1.3B |
-
+All launch_configs are listed in `launch_configs/README.md`.
 **Single node:**
 
 ```bash
-bash runs/run_training.sh launch_configs/parcae-small-140m.yaml parcae-small 8
+bash runs/run_training.sh launch_configs/parcae/pretrain/parcae-small-140m.yaml parcae-small-140m parcae 8
+```
+or
+```bash
+bash runs/run_finetuning.sh launch_configs/parcae/finetune/benice-770m.yaml benice-770m benice 8
 ```
 
 **Multi-node (Slurm):**
 
 ```bash
-CONFIG=launch_configs/parcae-large-770m.yaml sbatch launch_job.slurm
+CONFIG=launch_configs/parcae/pretrain/parcae-large-770m.yaml sbatch launch_job.slurm
+```
+or
+
+```bash
+CONFIG=launch_configs/benice/pretrain/parcae-xlarge-1_3b.yaml sbatch launch_job.slurm
 ```
 
 ## Eval
@@ -133,15 +140,28 @@ python scripts/eval.py --hf_repo SandyResearch/parcae-140m --eval_tasks bpb \
     --tasks.bpb.val_data_dir /path/to/val/data
 ```
 
+**Tokenizer.** `scripts/eval.py --hf_repo` and `scripts/finetune.py` read the tokenizer from the
+`PARCAE_TOKENIZER` environment variable, which defaults to `SandyResearch/parcae-tokenizer`
+(the FineWeb-Edu tokenizer used by the `parcae-*` models). The BeNice models, and every model
+trained on ClimbMix, use a different vocabulary, so set it before evaluating or finetuning them:
+
+```bash
+export PARCAE_TOKENIZER=SandyResearch/parcae-climbmix-tokenizer
+python scripts/eval.py --hf_repo SandyResearch/benice-140m --config eval_configs/eval-val-loss-compress-s1.yaml \
+    --tasks.kv_cache_val.val_data_dir /resource/data/climbmix-shuffle/val
+```
+
 Available eval configs in `eval_configs/`:
 - `eval-core.yaml` — Core benchmark suite
 - `eval-core-extended.yaml` — Extended core benchmarks
+- `eval-core-extended-compress-s1.yaml` - Extended core benchmarks under KV-sharing
 - `eval-val-loss.yaml` — Validation loss / bits-per-byte
 - `eval-lambada.yaml` — LAMBADA evaluation
+- `eval-val-loss-compress-s1.yaml` - Validation loss / bits-per-byte under KV-sharing
 
 # Pretrained Models
 
-Pretrained models are uploaded to [Hugging Face](https://huggingface.co/SandyResearch): `parcae-140m`, `parcae-370m`, `parcae-770m`, `parcae-1.3b`, trained on the [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) dataset. Models will be auto-downloaded when using `from_pretrained`.
+Pretrained models are uploaded to [Hugging Face](https://huggingface.co/SandyResearch): `parcae-140m`, `parcae-370m`, `parcae-770m`, `parcae-1.3b`, trained on the [FineWeb-Edu](https://huggingface.co/datasets/SandyResearch/fineweb-edu-shuffled) dataset. Models will be auto-downloaded when using `from_pretrained`.
 
 These models dimensions are:
 
@@ -154,6 +174,16 @@ These models dimensions are:
 
 Note: these are base models without any form of downstream modification (instruction tuning, etc.). 
 
+Finetuned models are uploaded to [Hugging Face](https://huggingface.co/SandyResearch): `benice-140m`, `benice-370m`, `benice-770m`, `benice-1.3b`, pretrained and finetuned on the [ClimbMix](https://huggingface.co/datasets/SandyResearch/climbmix-shuffle) dataset. Models will be auto-downloaded when using `from_pretrained`.
+
+| Model | Parameters | Prelude | Core | Coda | Model dim. | Recurrence |
+|-------|-----------|---------|------|------|-----------|------------|
+| BeNice-140M | 140M | 2 | 2 | 2 | 768 | 8 |
+| BeNice-370M | 370M | 4 | 4 | 4 | 1024 | 8 |
+| BeNice-770M | 770M | 6 | 6 | 6 | 1280 | 8 |
+| BeNice-1.3B | 1.3B | 8 | 8 | 8 | 1536 | 8 |
+
+Note: these are models only received BeNice! finetuning and no other downstream modification (instruction tuning, etc.). 
 
 # Replicating Scaling Laws
 
@@ -170,6 +200,18 @@ The sweep scripts in `runs/` reproduce the scaling law experiments from the pape
       archivePrefix={arXiv},
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2604.12946}, 
+}
+```
+
+```bibtex
+@misc{prairie2026beniceclosingloopingsinferencememory,
+      title={BeNice! Closing Looping's Inference-Memory Gap via KV-Sharing}, 
+      author={Hayden Prairie and Jacob M. Ryan and Taylor Berg-Kirkpatrick and Daniel Y. Fu},
+      year={2026},
+      eprint={2610.31633},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2610.31633}, 
 }
 ```
 

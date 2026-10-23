@@ -1,0 +1,81 @@
+run_name: parcae-large-770m
+resume: true
+max_tokens: 61_600_000_000
+seed: 42
+out_dir: "outputs/parcae-large-770m"
+model_name: parcae-large-770m
+model_impl: dynamic
+block_size: 2048
+
+# Eval at different recurrence depths (8 is added automatically as mean_recurrence)
+partial_depth_eval: [1, 2, 4]
+
+model_overwrite:
+  vocab_size: 32768
+  prelude_norm: true
+
+world_batch_size: 256
+micro_batch_size: 8
+
+optimizer: MuonAdamW
+optim_config:
+  lr: 6e-3
+  weight_decay: 0.0
+  betas: [0.8, 0.95]
+  eps: 1e-10
+  muon_lr: 8e-3
+  muon_momentum: 0.95
+  muon_wd: 0.2
+  muon_ns_steps: 5
+
+warmup_steps: 0.0
+cooldown_steps: 0.5
+lr_schedule: trapezoid
+min_lr: 0
+grad_clip: 1.0
+no_weight_decay_for_bias_and_norm_params: True
+
+z_regularization: 0
+label_smoothing: 0
+
+fabric_strategy: ddp
+fabric_precision: bf16-mixed
+fabric:
+  optim_sharding: False
+
+compile_model: True
+gradient_checkpointing: False
+
+loss_guardrail_active: True
+skip_nonfinite_grads: True
+allow_nonfinite_loss: False
+
+logger_project: "parcae"
+model_telemetry: True
+log_step_interval: 1
+save_step_interval: 4096
+eval_step_interval: 4096
+eval_iters: 16
+save_last_step: True
+
+all_block_size_tensors: False
+pack_sequences: True
+
+data_config:
+  train_data:
+    - type: pqds-pure
+      prefix: ""
+      weight: 1
+      data_dir: "/resource/data/fineweb-edu-shuffled/data/sample-100BT/train"
+      data_signature:
+        keys: ["text"]
+  val_data:
+    - type: pqds-pure
+      prefix: ""
+      weight: 1
+      data_dir: "/resource/data/fineweb-edu-shuffled/data/val/train"
+      data_signature:
+        keys: ["text"]
+
+tokenizer_path: "SandyResearch/parcae-tokenizer"
+

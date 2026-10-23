@@ -2,7 +2,7 @@
 set -e
 
 MODEL="parcae-small-140m"
-CONFIG="launch_configs/parcae-small-140m.yaml"
+CONFIG="launch_configs/parcae/pretrain/parcae-small-140m.yaml"
 LABEL="feb26"
 GPUS=8
 NNODES=1

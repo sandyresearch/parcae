@@ -60,7 +60,7 @@ class SimpleZeroRedundancyOptimizer(Optimizer):
             local_param_groups.extend(params[2:])  # append all higher groups (scalers) to all local ranks
 
             self.local_optim_group = optimizer_class(local_param_groups, **optimizer_class_kwargs)
-            torch.distributed.barrier()
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
         super().__init__(params, {})  # this way, super covers all (non-sharded parameters!)
         if self.verbose:

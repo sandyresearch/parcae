@@ -83,9 +83,10 @@ class ParcaeConfig(Config):
             _is_recurrent_block_config=True,
         )
         
-        recurrent_config.head_size = recurrent_config.n_embd // recurrent_config.num_attention_heads
-        recurrent_config.n_head = recurrent_config.num_attention_heads
-        recurrent_config.n_query_groups = recurrent_config.num_key_value_heads
+        if not recurrent_config.is_mla:
+            recurrent_config.head_size = recurrent_config.n_embd // recurrent_config.num_attention_heads
+            recurrent_config.n_head = recurrent_config.num_attention_heads
+            recurrent_config.n_query_groups = recurrent_config.num_key_value_heads
         
         effective_expected_depth = (
             self.n_layers_in_prelude + self.n_layers_in_coda + 

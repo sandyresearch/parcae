@@ -1,0 +1,11 @@
+eval_name: val_loss_compress_s1
+eval_tasks: kv_cache_val
+precision: bf16
+device_batch_size: 1
+tasks:
+  kv_cache_val:
+    val_data_dir: null  # Set to your val data path
+    max_samples: 50
+    max_files: 5
+    strategies:
+      - compress-s1

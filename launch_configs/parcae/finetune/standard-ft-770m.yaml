@@ -1,0 +1,42 @@
+run_name: standard-ft-770m
+model: SandyResearch/parcae-770m
+out_dir: outputs/standard-ft-770m
+
+aux: none
+trainable: all
+
+optimizer: MuonAdamW
+optim_config:
+  lr: 5.5556e-5
+  betas: [0.8, 0.95]
+  eps: 1.0e-10
+  weight_decay: 0.0
+  muon_wd: 0.2
+  grad_clip: 1.0
+
+lr_schedule:
+  schedule: wsd
+  warmup_frac: 0.05
+  decay_frac: 0.20
+  min_lr_ratio: 0.0
+
+world_batch_size: 256
+micro_batch_size: 4
+seq_len: 2048
+num_recurrence: 8
+recurrence_sampling: poisson
+lockstep_n: true
+steps: 1800
+
+train_dir: /resource/data/fineweb-edu-shuffled/data/sample-100BT/train
+val_dir: /resource/data/fineweb-edu-shuffled/data/val/train
+
+save_at: []
+save_ckpt: true
+log_every: 25
+model_telemetry: true
+telemetry_every: 25
+
+wandb_project: parcae-kv-finetune
+wandb_group: standard-ft
+wandb_tags: [770m, standard-ft]

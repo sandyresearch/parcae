@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager
 from typing import Any, Optional, TYPE_CHECKING
 
 import torch
@@ -13,6 +14,17 @@ from parcae_lm.ops import LinearCrossEntropyLoss
 from parcae_lm.modules.utils import precompute_freqs_cis
 from parcae_lm.modules.injection import _get_injection_method
 from parcae_lm.modules.mixer import has_ve
+
+
+# Liger's Triton kernel has signatures that torch.compile's dynamo can't trace through,
+# plus an internal `.item()` that forces a graph break anyway. Wrap the call with
+# `torch._dynamo.disable` so dynamo treats it as opaque: compile the trunk up to here,
+# hand off to eager, resume compilation after. Without this, autotune crashes with
+# illegal-memory-access during inductor's coord_desc tuning.
+@torch._dynamo.disable(recursive=True)
+def _call_liger_eager(loss_fn, weight, x, labels):
+    return loss_fn(weight, x, labels)
+
 
 class Parcae(torch.nn.Module):
     _default_objective = {"ignore_index": -100, "z_regularization": 0.0}
@@ -64,8 +76,17 @@ class Parcae(torch.nn.Module):
             transformer_dict["ln_prelude"] = config.Norm(config.n_embd, eps=config.norm_eps)
         self.transformer = torch.nn.ModuleDict(transformer_dict)
 
-        head_dim = config.n_embd // config.num_attention_heads
-        kv_dim = config.num_key_value_heads * head_dim
+        if config.is_mla:
+            # ve rides on the materialized per-head V; every query head has one under MLA.
+            kv_dim = config.num_attention_heads * config.v_head_dim
+            rec = config.recurrent_block_config
+            assert rec.num_attention_heads * rec.v_head_dim == kv_dim, (
+                "value_embeds is built once and shared across prelude/core/coda, so the outer and "
+                f"recurrent configs must agree on n_head*v_head_dim ({kv_dim} vs "
+                f"{rec.num_attention_heads * rec.v_head_dim})."
+            )
+        else:
+            kv_dim = config.num_key_value_heads * (config.n_embd // config.num_attention_heads)
         n_effective_layers = config.n_layers_in_prelude + config.n_layers_in_recurrent_block + config.n_layers_in_coda
         self.value_embeds = torch.nn.ModuleDict({
             str(i): torch.nn.Embedding(config.padded_vocab_size, kv_dim)
@@ -96,6 +117,20 @@ class Parcae(torch.nn.Module):
                 init_method=config.init.fn("head"),
                 transposed_weight=not self.config.tie_embeddings,
             )
+        elif self.config.use_fused_head == "liger":
+            self.lm_head = config.Linear(
+                config.n_embd, config.padded_vocab_size, bias=False, init_method=config.init.fn("head")
+            )
+            from liger_kernel.transformers.fused_linear_cross_entropy import (
+                LigerFusedLinearCrossEntropyLoss,
+            )
+            self._liger_loss_fn = LigerFusedLinearCrossEntropyLoss(
+                ignore_index=objective["ignore_index"],
+                lse_square_scale=objective["z_regularization"],
+                label_smoothing=0.0,
+                reduction="mean",
+                softcap=float(self.config.logit_softcap) if self.config.logit_softcap else None,
+            )
         else:
             self.lm_head = config.Linear(
                 config.n_embd, config.padded_vocab_size, bias=False, init_method=config.init.fn("head")
@@ -124,8 +159,10 @@ class Parcae(torch.nn.Module):
             max_length = self.config.randomize_positions_from
         else:
             max_length = self.config.block_size
+        # MLA rotates only the decoupled qk_rope slice
+        rope_dim = self.config.qk_rope_head_dim if self.config.is_mla else dim // self.config.num_attention_heads
         freqs_cis = precompute_freqs_cis(
-            dim // self.config.num_attention_heads,
+            rope_dim,
             max_length,
             self.config.rope_settings.rope_base,  # 50k in the newer models
             self.config.rope_settings.rope_condense_ratio,
@@ -144,6 +181,10 @@ class Parcae(torch.nn.Module):
         labels: Optional[torch.Tensor] = None,
         return_logits: bool = False,
         num_steps_pair: Optional[torch.Tensor] = None,
+        *,
+        n_per_sample: Optional[torch.Tensor] = None,
+        k_per_sample: Optional[torch.Tensor] = None,
+        past_key_values=None,
     ) -> dict[str, Optional[torch.Tensor]]:
         if self.config.randomize_positions_from is not None and self.training:
             position_ids = torch.sort(  # need to fork rng for distributed
@@ -168,11 +209,14 @@ class Parcae(torch.nn.Module):
         if self.config.prelude_norm:
             input_embeds = self.transformer.ln_prelude(input_embeds)
 
-        x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(
+        x, num_steps_no_grad, num_steps_with_grad, xk, max_steps_no_grad, max_steps_with_grad, min_steps_no_grad, min_steps_with_grad, min_total_recurrence = self.iterate_forward(
             input_embeds,  # type: ignore
             freqs_cis,
             attention_mask,
             num_steps_pair,
+            n_per_sample=n_per_sample,
+            k_per_sample=k_per_sample,
+            past_key_values=past_key_values,
         )
         x_rec_output = x
 
@@ -193,18 +237,34 @@ class Parcae(torch.nn.Module):
             x = self.transformer.ln_f(x)
 
         if self.monitoring:
-            self.monitor_module(x, x_rec_output, xk, input_embeds, num_steps_no_grad, num_steps_with_grad, x_rec_projected)
+            self.monitor_module(
+                x, x_rec_output, xk, input_embeds, num_steps_no_grad, num_steps_with_grad, x_rec_projected,
+                max_steps_no_grad, max_steps_with_grad, min_steps_no_grad, min_steps_with_grad, min_total_recurrence,
+            )
 
         if labels is not None:
             logits = None
             if self.config.use_fused_head == "cce":
                 from cut_cross_entropy import linear_cross_entropy  # type: ignore[unusal import]
 
+                # cce kernel requires bf16/fp16 inputs and weights. Under bf16-mixed the
+                # final norm typically leaves x in fp32 and the fp32 master weight is what's
+                # stored on lm_head; cast both to bf16 just for the cce call.
+                x_bf16 = (x * self.config.init.logit_scale).to(torch.bfloat16)
+                weight_bf16 = self.lm_head.weight.to(torch.bfloat16)
                 loss = linear_cross_entropy(
-                    x * self.config.init.logit_scale, self.lm_head.weight, labels, filter_eps="auto"
+                    x_bf16, weight_bf16, labels, filter_eps="auto"
                 )
-            elif self.config.use_fused_head == "hhe" or self.config.use_fused_head == "full-triton":
+            elif self.config.use_fused_head == "hhe":
                 loss = self.lm_head(x * self.config.init.logit_scale, labels)
+            elif self.config.use_fused_head == "full-triton":
+                loss = self.lm_head(x, labels)  # LinearCrossEntropyLoss applies logit_scale itself
+            elif self.config.use_fused_head == "liger":
+                # Liger expects flat (N, H) embeddings and (N,) labels.
+                # Apply logit_scale on x (matmul is linear, equivalent to scaling logits).
+                x_flat = (x * self.config.init.logit_scale).reshape(-1, x.shape[-1])
+                labels_flat = labels.reshape(-1)
+                loss = _call_liger_eager(self._liger_loss_fn, self.lm_head.weight, x_flat, labels_flat)
             else:
                 logits = self.lm_head(x).float() * self.config.init.logit_scale
                 if self.config.logit_softcap is not None:
@@ -238,14 +298,66 @@ class Parcae(torch.nn.Module):
             "log_ppl": log_ppl,
         }
     
-    def update_recurrent_state(self, x, input_embeds, freq_cis, mask, step: Tensor, total_steps: Tensor):
-        return self.core_block_forward(x, input_embeds, freq_cis, mask, step, total_steps)
-    
+    def update_recurrent_state(self, x, input_embeds, freq_cis, mask, step: Tensor, total_steps: Tensor, **kwargs):
+        return self.core_block_forward(x, input_embeds, freq_cis, mask, step, total_steps, **kwargs)
+
+    def _recurrent_step_kwargs(
+        self,
+        step: int,
+        *,
+        past_key_values=None,
+    ) -> dict:
+        if past_key_values is None:
+            return {}
+        n_prelude = len(self.transformer.prelude)
+        n_core = len(self.transformer.core_block)
+        return {
+            "past_key_values": past_key_values,
+            "step_idx_base": n_prelude + step * n_core,
+        }
+
+    @staticmethod
+    @contextmanager
+    def _no_grad_prefix():
+        # Autocast caches each weight's low-precision cast at its first use. Casts made under
+        # no_grad have no autograd history, so if the with-grad steps reused them the core
+        # weights would get no gradient. Keep those casts out of the cache.
+        if torch.compiler.is_compiling():
+            with torch.no_grad():
+                yield
+            return
+        cache_enabled = torch.is_autocast_cache_enabled()
+        torch.set_autocast_cache_enabled(False)
+        try:
+            with torch.no_grad():
+                yield
+        finally:
+            torch.set_autocast_cache_enabled(cache_enabled)
+
     @torch._dynamo.disable(recursive=False)  # type: ignore
-    def iterate_forward(self, input_embeds, freqs_cis, mask, num_steps_pair: Optional[torch.Tensor] = None):
+    def iterate_forward(
+        self,
+        input_embeds,
+        freqs_cis,
+        mask,
+        num_steps_pair: Optional[torch.Tensor] = None,
+        *,
+        n_per_sample: Optional[torch.Tensor] = None,
+        k_per_sample: Optional[torch.Tensor] = None,
+        past_key_values=None,
+    ):
+        if (
+            past_key_values is not None
+            and self.gradient_checkpointing
+            and "per-iteration" in self.config.activation_checkpoint_impl
+        ):
+            raise ValueError("past_key_values is not supported with per-iteration activation checkpointing.")
         x = self.initialize_state(input_embeds)
+        per_token = self.recurrent_iteration_method == "per-token"
 
         if self.recurrent_iteration_method in ["per-batch"]:
+            if n_per_sample is not None or k_per_sample is not None:
+                raise ValueError("n_per_sample/k_per_sample require per-sequence or per-token iteration")
             if num_steps_pair is None:
                 num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()  # type: ignore
             elif len(num_steps_pair) > 1:
@@ -255,11 +367,12 @@ class Parcae(torch.nn.Module):
 
             num_steps_no_grad_int = int(num_steps_no_grad) if isinstance(num_steps_no_grad, torch.Tensor) else num_steps_no_grad
             num_steps_with_grad_int = int(num_steps_with_grad) if isinstance(num_steps_with_grad, torch.Tensor) else num_steps_with_grad
+            n_per_sample = None
+            k_per_sample = None
         elif self.recurrent_iteration_method in ["per-sequence", "per-token"]:
             t = max(self.config.mean_recurrence - self.config.mean_backprop_depth, 0)
             s = self.config.mean_backprop_depth
-            per_token = self.recurrent_iteration_method == "per-token"
-            
+
             if input_embeds.is_meta:
                 num_steps_no_grad_int = t
                 num_steps_with_grad_int = s
@@ -267,33 +380,42 @@ class Parcae(torch.nn.Module):
                 num_steps_with_grad = s
                 n_per_sample = None
                 k_per_sample = None
+            elif n_per_sample is not None and k_per_sample is not None:
+                n_per_sample = n_per_sample.to(input_embeds.device)
+                k_per_sample = k_per_sample.to(input_embeds.device)
+                num_steps_no_grad_int = int(n_per_sample.max().item())
+                num_steps_with_grad_int = int(k_per_sample.max().item())
+                num_steps_no_grad = n_per_sample.float().mean().to(torch.long)
+                num_steps_with_grad = k_per_sample.float().mean().to(torch.long)
+            elif num_steps_pair is None:
+                seq_len = input_embeds.shape[1] if per_token else None
+                n_per_sample, k_per_sample = self._sample_batch_depths(input_embeds.shape[0], seq_len)
+                n_per_sample = n_per_sample.to(input_embeds.device)
+                k_per_sample = k_per_sample.to(input_embeds.device)
+                num_steps_no_grad_int = int(n_per_sample.max().item())
+                num_steps_with_grad_int = int(k_per_sample.max().item())
+                num_steps_no_grad = n_per_sample.float().mean().to(torch.long)
+                num_steps_with_grad = k_per_sample.float().mean().to(torch.long)
             else:
-                if num_steps_pair is None:
-                    seq_len = input_embeds.shape[1] if per_token else None
-                    n_per_sample, k_per_sample = self._sample_batch_depths(input_embeds.shape[0], seq_len)
-                    n_per_sample = n_per_sample.to(input_embeds.device)
-                    k_per_sample = k_per_sample.to(input_embeds.device)
-                    num_steps_no_grad_int = int(n_per_sample.max().item())
-                    num_steps_with_grad_int = int(k_per_sample.max().item())
-                    num_steps_no_grad = n_per_sample.float().mean().to(torch.long)
-                    num_steps_with_grad = k_per_sample.float().mean().to(torch.long)
+                n_per_sample = None
+                k_per_sample = None
+                if len(num_steps_pair) > 1:
+                    num_steps_no_grad, num_steps_with_grad = num_steps_pair
                 else:
-                    n_per_sample = None
-                    k_per_sample = None
-                    if len(num_steps_pair) > 1:
-                        num_steps_no_grad, num_steps_with_grad = num_steps_pair
-                    else:
-                        num_steps_no_grad, num_steps_with_grad = num_steps_pair, torch.tensor(0)
-                    num_steps_no_grad_int = int(num_steps_no_grad) if isinstance(num_steps_no_grad, torch.Tensor) else num_steps_no_grad
-                    num_steps_with_grad_int = int(num_steps_with_grad) if isinstance(num_steps_with_grad, torch.Tensor) else num_steps_with_grad
+                    num_steps_no_grad, num_steps_with_grad = num_steps_pair, torch.tensor(0)
+                num_steps_no_grad_int = int(num_steps_no_grad) if isinstance(num_steps_no_grad, torch.Tensor) else num_steps_no_grad
+                num_steps_with_grad_int = int(num_steps_with_grad) if isinstance(num_steps_with_grad, torch.Tensor) else num_steps_with_grad
         else:
             raise ValueError(f"Invalid recurrent iteration method: {self.recurrent_iteration_method}")
 
         total_steps_int = num_steps_no_grad_int + num_steps_with_grad_int
         total_steps = torch.tensor(total_steps_int, device=input_embeds.device)
+        # Exposed for RecFT endpoint capture / logging; None on scalar paths.
+        self._current_n_per_sample = n_per_sample
+        self._current_k_per_sample = k_per_sample
 
         if self.recurrent_iteration_method in ["per-batch"]:
-            with torch.no_grad():
+            with self._no_grad_prefix():
                 # ultra annoying in ddp due to
                 # https://discuss.pytorch.org/t/does-distributeddataparallel-work-with-torch-no-grad-and-find-unused-parameters-false/122594
                 # for now running with find_unused_params=True enabled even though the graph structure is (technically) clear
@@ -301,71 +423,137 @@ class Parcae(torch.nn.Module):
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x = self.update_recurrent_state(
+                        xk,
+                        input_embeds,
+                        freqs_cis,
+                        mask,
+                        step_t,
+                        total_steps,
+                        **self._recurrent_step_kwargs(step, past_key_values=past_key_values),
+                    )
 
 
             for step in range(num_steps_with_grad_int):
                 xk = x
-                step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
+                abs_step = num_steps_no_grad_int + step
+                step_t = torch.tensor(abs_step, device=input_embeds.device)
+                step_kwargs = self._recurrent_step_kwargs(
+                    abs_step, past_key_values=past_key_values
+                )
                 if self.gradient_checkpointing and "per-iteration" in self.config.activation_checkpoint_impl:
                     x = self.config.checkpoint(
                         self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps
                     )
                 else:
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
-        
+                    x = self.update_recurrent_state(
+                        xk, input_embeds, freqs_cis, mask, step_t, total_steps, **step_kwargs
+                    )
+
         elif self.recurrent_iteration_method in ["per-sequence", "per-token"]:
             if n_per_sample is None:
-                with torch.no_grad():
+                with self._no_grad_prefix():
                     for step in range(num_steps_no_grad_int):
                         xk = x
                         step_t = torch.tensor(step, device=input_embeds.device)
-                        x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                        x = self.update_recurrent_state(
+                            xk,
+                            input_embeds,
+                            freqs_cis,
+                            mask,
+                            step_t,
+                            total_steps,
+                            **self._recurrent_step_kwargs(step, past_key_values=past_key_values),
+                        )
 
                 for step in range(num_steps_with_grad_int):
                     xk = x
-                    step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
+                    abs_step = num_steps_no_grad_int + step
+                    step_t = torch.tensor(abs_step, device=input_embeds.device)
+                    step_kwargs = self._recurrent_step_kwargs(
+                        abs_step, past_key_values=past_key_values
+                    )
                     if self.gradient_checkpointing and "per-iteration" in self.config.activation_checkpoint_impl:
                         x = self.config.checkpoint(
                             self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps
                         )
                     else:
-                        x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                        x = self.update_recurrent_state(
+                            xk, input_embeds, freqs_cis, mask, step_t, total_steps, **step_kwargs
+                        )
             else:
                 # Normal mode - use torch.where to gate updates per sample (or per token)
-                with torch.no_grad():
+                with self._no_grad_prefix():
                     for step in range(num_steps_no_grad_int):
                         xk = x
                         active_mask = (step < n_per_sample)  # [batch_size] or [batch_size, seq_len]
                         step_t = torch.tensor(step, device=input_embeds.device)
-                        x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                        x_new = self.update_recurrent_state(
+                            xk,
+                            input_embeds,
+                            freqs_cis,
+                            mask,
+                            step_t,
+                            total_steps,
+                            **self._recurrent_step_kwargs(step, past_key_values=past_key_values),
+                        )
                         mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                         x = torch.where(mask_expanded, x_new, x)
 
                 for step in range(num_steps_with_grad_int):
                     xk = x
                     active_mask = (step < k_per_sample)  # [batch_size] or [batch_size, seq_len]
-                    step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
+                    abs_step = num_steps_no_grad_int + step
+                    step_t = torch.tensor(abs_step, device=input_embeds.device)
+                    step_kwargs = self._recurrent_step_kwargs(
+                        abs_step, past_key_values=past_key_values
+                    )
                     if self.gradient_checkpointing and "per-iteration" in self.config.activation_checkpoint_impl:
                         x_new = self.config.checkpoint(
                             self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps
                         )
                     else:
-                        x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                        x_new = self.update_recurrent_state(
+                            xk, input_embeds, freqs_cis, mask, step_t, total_steps, **step_kwargs
+                        )
                     mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                     x = torch.where(mask_expanded, x_new, x)
         else:
             raise ValueError(f"Invalid recurrent iteration method: {self.recurrent_iteration_method}")
 
-        return x, num_steps_no_grad, num_steps_with_grad, xk.detach()
+        max_steps_no_grad = torch.tensor(num_steps_no_grad_int, device=input_embeds.device, dtype=torch.long)
+        max_steps_with_grad = torch.tensor(num_steps_with_grad_int, device=input_embeds.device, dtype=torch.long)
+        if n_per_sample is not None and k_per_sample is not None:
+            min_steps_no_grad = n_per_sample.min().to(device=input_embeds.device, dtype=torch.long)
+            min_steps_with_grad = k_per_sample.min().to(device=input_embeds.device, dtype=torch.long)
+            min_total_recurrence = (n_per_sample + k_per_sample).min().to(device=input_embeds.device, dtype=torch.long)
+        else:
+            min_steps_no_grad = max_steps_no_grad
+            min_steps_with_grad = max_steps_with_grad
+            min_total_recurrence = max_steps_no_grad + max_steps_with_grad
+        return (
+            x,
+            num_steps_no_grad,
+            num_steps_with_grad,
+            xk.detach(),
+            max_steps_no_grad,
+            max_steps_with_grad,
+            min_steps_no_grad,
+            min_steps_with_grad,
+            min_total_recurrence,
+        )
     
     def core_block_forward(
         self, x, input_embeds, freqs_cis, mask, step: Tensor, total_steps: Tensor, **kwargs
     ):
         x = self.transformer.adapter(x,input_embeds)
 
-        if not self.training:
-            past_key_values = kwargs.get("past_key_values")
+        past_key_values = kwargs.get("past_key_values")
+        # Honor explicit cache/step indexing during training so RecFT can reuse
+        # iterate_forward while still capturing recurrence endpoints.
+        if "step_idx_base" in kwargs or past_key_values is not None:
+            step_idx_base = kwargs.get("step_idx_base", 0)
+        elif not self.training:
             step_idx_base = kwargs.get("step_idx_base", 0)
         else:
             past_key_values = None
@@ -378,12 +566,21 @@ class Parcae(torch.nn.Module):
             block_kwargs = {"ve": ve}
             if past_key_values is not None:
                 block_kwargs["past_key_values"] = past_key_values
+                # MLA read-time ve reconstruction needs the layer's value_embeds table. Ignored for MHA / non-cache paths.
+                block_kwargs["ve_table"] = self.value_embeds[ve_idx] if ve_idx in self.value_embeds else None
                 block_kwargs["step_idx"] = torch.tensor(step_idx_base + layer_idx, dtype=torch.long)
             if self.gradient_checkpointing and "per-block" in self.config.activation_checkpoint_impl:
                 x = self.config.checkpoint(block, x, freqs_cis, mask, **block_kwargs)
             else:
                 x = block(x, freqs_cis, mask, **block_kwargs)
         return x
+
+    def _truncated_full_depths(
+        self, total: torch.Tensor, s: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k = torch.clamp(total, max=s)
+        n = total - k
+        return n, k
 
     @torch._dynamo.disable(recursive=False)  # type: ignore
     def randomized_iteration_sampler(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -452,8 +649,8 @@ class Parcae(torch.nn.Module):
                 n = torch.poisson(torch.tensor([t], dtype=torch.float), generator=n_generator)
                 k = torch.as_tensor(s)
             elif "poisson-truncated-full" in self.config.sampling_scheme:
-                n = torch.clamp(torch.poisson(torch.tensor([t + s], dtype=torch.float), generator=n_generator), min=1)
-                k = torch.clamp(n, max=s)
+                total = torch.clamp(torch.poisson(torch.tensor([t + s], dtype=torch.float), generator=n_generator), min=1)
+                n, k = self._truncated_full_depths(total, int(s))
             elif "poisson-full" in self.config.sampling_scheme:
                 n = torch.as_tensor(0)
                 k = torch.clamp(torch.poisson(torch.tensor([t + s], dtype=torch.float), generator=k_generator), min=1)
@@ -477,6 +674,12 @@ class Parcae(torch.nn.Module):
     @torch._dynamo.disable(recursive=False)  # type: ignore
     def _sample_batch_depths(self, batch_size: int, seq_len: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
         shape = (batch_size, seq_len) if seq_len is not None else (batch_size,)
+        if not self.training:
+            # Eval: every sequence runs mean_recurrence steps, as in randomized_iteration_sampler.
+            return (
+                torch.full(shape, self.config.mean_recurrence, dtype=torch.long),
+                torch.zeros(shape, dtype=torch.long),
+            )
         if "curriculum-" in self.config.sampling_scheme:
             curriculum_part = self.config.sampling_scheme.split("curriculum-")[1]
             if curriculum_part.startswith("sqrt-"):
@@ -519,8 +722,15 @@ class Parcae(torch.nn.Module):
         # Sample on CPU - per batch element (or per token if seq_len provided)
         if "poisson-truncated-full" in self.config.sampling_scheme:
             total = torch.clamp(torch.poisson(torch.full(shape, float(t + s)), generator=generator), min=1)
-            k = torch.clamp(total, max=s)
-            n = total - k
+            n, k = self._truncated_full_depths(total, int(s))
+            # Avoid a rank-local all-zero no-grad prefix. In eager DDP this can
+            # desynchronize gradient collectives when it lands on a sync step.
+            while bool(torch.all(n == 0)):
+                total = torch.clamp(
+                    torch.poisson(torch.full(shape, float(t + s)), generator=generator),
+                    min=1,
+                )
+                n, k = self._truncated_full_depths(total, int(s))
         elif "poisson-full" in self.config.sampling_scheme:
             n = torch.zeros(shape, dtype=torch.long)
             k = torch.clamp(torch.poisson(torch.full(shape, float(t + s)), generator=generator), min=1)
@@ -565,6 +775,11 @@ class Parcae(torch.nn.Module):
         num_steps_no_grad: torch.Tensor,
         num_steps_with_grad: torch.Tensor,
         x_rec_projected: torch.Tensor,
+        max_steps_no_grad: torch.Tensor,
+        max_steps_with_grad: torch.Tensor,
+        min_steps_no_grad: torch.Tensor,
+        min_steps_with_grad: torch.Tensor,
+        min_total_recurrence: torch.Tensor,
     ):
         x_out_c = x_out - x_out.mean(dim=-1, keepdim=True)
         normed_x = x_out_c / x_out_c.norm(dim=-1, keepdim=True)
@@ -573,18 +788,42 @@ class Parcae(torch.nn.Module):
         x_rec_c = x_rec - x_rec.mean(dim=-1, keepdim=True)
         normed_x = x_rec_c / x_rec_c.norm(dim=-1, keepdim=True)
         token_corr_rec = (normed_x @ normed_x.transpose(1, 2)).mean() - 1 / x_rec.shape[1]
+        prelude_output_norm = input_embeds.norm(dim=-1).mean()
+        recurrent_state_norm = x_rec.norm(dim=-1).mean()
 
         metrics = {
             "last_hidden_token_corr": token_corr,
             "recurrent_state_token_corr": token_corr_rec,
             "last_hidden_norm": x_out.norm(dim=-1).mean(),
-            "recurrent_state_norm": x_rec.norm(dim=-1).mean(),
+            "prelude_output_norm": prelude_output_norm,
+            "recurrent_state_norm": recurrent_state_norm,
+            "recurrent_to_prelude_norm_ratio": (
+                recurrent_state_norm / prelude_output_norm.clamp_min(1e-8)
+            ),
             "recurrent_diff": (x_rec_projected - input_embeds).norm(dim=-1).mean(),
             "num_steps_no_grad": num_steps_no_grad,
             "num_steps_with_grad": num_steps_with_grad,
+            "max_steps_no_grad": max_steps_no_grad,
+            "max_steps_with_grad": max_steps_with_grad,
+            "max_total_recurrence": max_steps_no_grad + max_steps_with_grad,
+            "min_steps_no_grad": min_steps_no_grad,
+            "min_steps_with_grad": min_steps_with_grad,
+            "min_total_recurrence": min_total_recurrence,
             "recurrent_residual": (x_rec - xk).norm(dim=-1).mean(),
             "rel_residual": ((x_rec - xk).norm(dim=-1) / x_rec.norm(dim=-1)).mean(),
         }
+        adapter = self.transformer.adapter
+        if all(hasattr(adapter, name) for name in ("A_log", "dt_bias", "B")):
+            dt = torch.nn.functional.softplus(adapter.dt_bias)
+            decay = torch.exp(-dt * torch.exp(adapter.A_log))
+            injection = dt * (input_embeds @ adapter.B.T)
+            metrics.update(
+                {
+                    "adapter_injection_norm": injection.norm(dim=-1).mean(),
+                    "adapter_decay_mean": decay.mean(),
+                    "adapter_decay_max": decay.max(),
+                }
+            )
         self.latest_metrics = metrics
         
         if self.extreme_monitoring:

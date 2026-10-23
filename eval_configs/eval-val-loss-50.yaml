@@ -1,0 +1,11 @@
+# Plain val loss on the same 50 documents as eval-val-loss-compress-s1.yaml; run both to compare
+# full and compress-s1 on identical samples.
+eval_name: val_loss_50
+eval_tasks: bpb
+precision: bf16
+device_batch_size: 1
+tasks:
+  bpb:
+    val_data_dir: null  # Set to your val data path
+    max_samples: 50
+    max_files: 5

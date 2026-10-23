@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parcae-lm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Parcae: Stable Looped Language Models"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
@@ -28,6 +28,8 @@ dependencies = [
     "transformers>=4.38.0",
     "packaging",
     "ninja",
+    "flash-linear-attention[cuda]==0.5.2",
+    "liger-kernel==0.8.0",
 ]
 
 [project.urls]

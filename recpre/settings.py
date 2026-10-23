@@ -76,6 +76,9 @@ class FabricConfig:
     allow_optim_fusion: bool = False
     use_apex_adamw: bool = False
     fsdp_use_original_params: bool = False
+    # Set True only for models with conditionally-used parameters (e.g. MoE).
+    ddp_find_unused_parameters: bool = False
+    bf16_grad_comm: bool = False
 
 
 @dataclass
@@ -160,6 +163,10 @@ class CLISettings:
     allow_nonfinite_loss: bool = False  # whether to end training immediately if non-finite loss is encountered
     compiled_autograd: bool = False
     compile_optimizer: bool = False
+    inductor_cudagraphs: bool = False
+    inductor_shape_padding: bool = False
+    inductor_donated_buffer: bool = False
+    prefer_cudnn_attention: bool = True
     dynamo_ddp_config: Literal["ddp_optimizer", "python_reducer", "no_optimization"] = "ddp_optimizer"
     loss_guardrail_active: bool = False
     skip_nonfinite_grads: bool = False
@@ -174,6 +181,11 @@ class CLISettings:
     data_telemetry: bool = False  # Data telemetry switch, set based on needs.
     model_telemetry: bool = True  # Whether to monitor important model values to look for spikes. May increase overhead
     extreme_telemetry: bool = False  # Enable expensive metrics like adapter spectral norms. Only computed when model_telemetry is also True.
+    spike_detection_enabled: bool = True
+    spike_factor: float = 5.0
+    spike_warmup_steps: int = 50
+    spike_ema_decay: float = 0.98
+    spike_log_top_k: int = 20
     shape_watching_steps: int = 3  # Number of iterations to watch shapes for. Set to 0 to disable.
     log_step_interval: int = 1  # The base interval for logging (scales with gradient_accumulation_steps).
     eval_iters: int = 100  # The number of iterations to process during a validation loop.

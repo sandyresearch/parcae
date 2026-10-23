@@ -48,7 +48,8 @@ def muon_step(g: Tensor, p: Tensor, m: Tensor, v: Tensor, mom: Tensor, lr: Tenso
 class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
-        self._t = {k: torch.tensor(0.0, dtype=torch.float32) for k in ['step', 'lr', 'b1', 'b2', 'eps', 'wd', 'mom', 'muon_lr', 'muon_wd', 'muon_b2']}
+        device = next((p.device for g in param_groups for p in g['params']), torch.device('cpu'))
+        self._t = {k: torch.tensor(0.0, dtype=torch.float32, device=device) for k in ['step', 'lr', 'b1', 'b2', 'eps', 'wd', 'mom', 'muon_lr', 'muon_wd', 'muon_b2']}
 
     def _adamw(self, group: dict):
         for p in group['params']:
@@ -63,7 +64,7 @@ class MuonAdamW(torch.optim.Optimizer):
             self._t['b1'].fill_(group['betas'][0])
             self._t['b2'].fill_(group['betas'][1])
             self._t['eps'].fill_(group['eps'])
-            self._t['wd'].fill_(group['weight_decay'])
+            self._t['wd'].fill_(0.0 if getattr(p, '_no_weight_decay', False) else group['weight_decay'])
             adamw_step(p, p.grad, s['m'], s['v'], self._t['step'], self._t['lr'], self._t['b1'], self._t['b2'], self._t['eps'], self._t['wd'])
 
     def _muon(self, group: dict):
@@ -103,11 +104,15 @@ def get_muon_param_groups(named_params, adamw_lr=3e-4, adamw_betas=(0.9, 0.95), 
         if not p.requires_grad:
             continue
         ln = name.lower()
+        is_value_embedding = 'value_embeds' in ln
         is_embed = any(x in ln for x in ['wte', 'embedding', 'embed', 'lm_head'])
         is_norm = any(x in ln for x in ['norm', 'ln_', 'bias'])
-        # Parcae recurrent params: A_log, B, C, dt_bias - use AdamW for stability
-        is_parcae_recurrent = any(x in ln for x in ['a_log', 'dt_bias', 'adapter.b', 'adapter.adapter', 'transformer.c.'])
-        if p.ndim < 2 or is_embed or is_norm or is_parcae_recurrent:
+        # Muon operates on 2D matrices; scalars, vectors and higher-dimensional tensors go through AdamW.
+        # 2D recurrent matrices (B, adapter, C) still go to Muon.
+        is_parcae_recurrent_1d = any(x in ln for x in ['a_log', 'dt_bias'])
+        if p.ndim != 2 or is_embed or is_norm or is_parcae_recurrent_1d:
+            if not is_value_embedding:
+                p._no_weight_decay = True
             adamw_params.append(p)
             if verbose:
                 print(f"AdamW: {name}")

@@ -1,6 +1,6 @@
 run_name: parcae-large-770m
 resume: true
-max_tokens: 61_600_000_000
+token_to_param_ratio: 7.0
 seed: 42
 out_dir: "outputs/parcae-large-770m"
 model_name: parcae-large-770m
@@ -13,19 +13,20 @@ partial_depth_eval: [1, 2, 4]
 model_overwrite:
   vocab_size: 32768
   prelude_norm: true
+  use_fused_head: liger
 
 world_batch_size: 256
-micro_batch_size: 8
+micro_batch_size: 16
 
 optimizer: MuonAdamW
 optim_config:
   lr: 6e-3
-  weight_decay: 0.0
+  weight_decay: 0.1
   betas: [0.8, 0.95]
   eps: 1e-10
   muon_lr: 8e-3
   muon_momentum: 0.95
-  muon_wd: 0.2
+  muon_wd: 0.3
   muon_ns_steps: 5
 
 warmup_steps: 0.0
@@ -42,19 +43,25 @@ fabric_strategy: ddp
 fabric_precision: bf16-mixed
 fabric:
   optim_sharding: False
+  bf16_grad_comm: True
 
 compile_model: True
+compile_mode: max-autotune-no-cudagraphs
 gradient_checkpointing: False
+compile_optimizer: False
+compiled_autograd: True
+dynamo_ddp_config: python_reducer
+inductor_shape_padding: True
 
 loss_guardrail_active: True
 skip_nonfinite_grads: True
 allow_nonfinite_loss: False
 
-logger_project: "parcae"
+logger_project: "parcae-random-testing"
 model_telemetry: True
 log_step_interval: 1
-save_step_interval: 4096
-eval_step_interval: 4096
+save_step_interval: 2048
+eval_step_interval: 512
 eval_iters: 16
 save_last_step: True
 
@@ -66,16 +73,15 @@ data_config:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/train"
+      data_dir: "/resource/data/climbmix-shuffle/400b"
       data_signature:
         keys: ["text"]
   val_data:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/val-resharded"
+      data_dir: "/resource/data/climbmix-shuffle/val"
       data_signature:
         keys: ["text"]
 
-tokenizer_path: "/resource/tokenizer/parcae_tokenizer"
-
+tokenizer_path: "SandyResearch/parcae-climbmix-tokenizer"

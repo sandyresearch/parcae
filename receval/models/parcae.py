@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import torch
 from pathlib import Path
@@ -25,6 +26,22 @@ class ModelingParcae(Parcae):
         config_dict.update(kwargs)
         for key in ["_class_name", "init"]:
             config_dict.pop(key, None)
+        # Released configs also carry rve_*, gdn_* and recurrence_depth_variance; they are dropped when inert.
+        if config_dict.get("rve_rank", 1) > 1:
+            raise ValueError("rve checkpoints are not supported")
+        if "GDN" in str(config_dict.get("attention_class_name", "")):
+            raise ValueError("GDN checkpoints are not supported")
+        if "fixed-var" in str(config_dict.get("sampling_scheme", "")):
+            raise ValueError("fixed-var sampling schemes are not supported")
+        known = {f.name for f in dataclasses.fields(ParcaeConfig)}
+        inert = {"rve_rank", "rve_bias", "rve_scale_by_sqrt_rank", "recurrence_depth_variance"}
+        for key in list(config_dict):
+            if key in known:
+                continue
+            if key in inert or key.startswith("gdn_"):
+                config_dict.pop(key)
+            else:
+                raise ValueError(f"unknown config key {key!r}")
         model = cls(ParcaeConfig(**config_dict))
         weights_path = None
         for name in ["pytorch_model.bin", "model.safetensors", "model.bin"]:
@@ -56,7 +73,7 @@ class ModelingParcae(Parcae):
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
         config_dict = self.config.__getstate__()
-        for key in ["_class_name", "_recurrent_block_config", "init"]:
+        for key in ["_recurrent_block_config", "init"]:
             config_dict.pop(key, None)
         with open(save_dir / "config.json", "w") as f:
             json.dump(config_dict, f, indent=2, default=str)
@@ -88,11 +105,25 @@ class ModelingParcae(Parcae):
     def prepare_inputs_for_generation(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> dict:
         return {"input_ids": input_ids, "attention_mask": attention_mask, "num_steps": kwargs.get("num_steps", self.config.mean_recurrence)}
 
-    def forward_for_generation(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, num_steps: Optional[int] = None, past_key_values=None, **kwargs) -> dict:
+    def forward_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
+        past_key_values=None,
+        grad_loops=None,
+        **kwargs,
+    ) -> dict:
+        # grad_loops: if not None, only those recurrence indices keep autograd; every
+        # other recurrence runs under torch.no_grad() (detaching x). This matches RecFT
+        # last4first / pretraining-style truncated BPTT without materializing the full
+        # T-loop graph. Default None => all loops grad => original eval/generate behavior.
         if num_steps is None:
             num_steps = self.config.mean_recurrence
         seq_len = input_ids.shape[1]
         cache_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if past_key_values is not None:
+            past_key_values._current_input_ids = input_ids
         freqs_cis = self.freqs_cis[:, cache_len:cache_len + seq_len]
         self._current_input_ids = input_ids
         x = self.transformer.wte(input_ids)
@@ -101,7 +132,10 @@ class ModelingParcae(Parcae):
         for i, block in enumerate(self.transformer.prelude):
             ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
             ve = ve_embed(input_ids) if ve_embed is not None else None
-            x = block(x, freqs_cis, attention_mask, past_key_values=past_key_values, step_idx=torch.tensor(i, dtype=torch.long), ve=ve)
+            x = block(
+                x, freqs_cis, attention_mask, past_key_values=past_key_values,
+                step_idx=torch.tensor(i, dtype=torch.long), ve=ve, ve_table=ve_embed,
+            )
         if self.config.prelude_norm:
             x = self.transformer.ln_prelude(x)
         input_embeds = x
@@ -110,7 +144,31 @@ class ModelingParcae(Parcae):
         x = self.initialize_state(input_embeds)
         total_steps = torch.tensor(num_steps)
         for recurrence in range(num_steps):
-            x = self.core_block_forward(x, input_embeds, freqs_cis, attention_mask, step=torch.tensor(recurrence), total_steps=total_steps, past_key_values=past_key_values, step_idx_base=n_prelude + recurrence * n_core)
+            step_t = torch.tensor(recurrence)
+            step_idx_base = n_prelude + recurrence * n_core
+            if grad_loops is not None and recurrence not in grad_loops:
+                with torch.no_grad():
+                    x = self.core_block_forward(
+                        x,
+                        input_embeds,
+                        freqs_cis,
+                        attention_mask,
+                        step=step_t,
+                        total_steps=total_steps,
+                        past_key_values=past_key_values,
+                        step_idx_base=step_idx_base,
+                    )
+            else:
+                x = self.core_block_forward(
+                    x,
+                    input_embeds,
+                    freqs_cis,
+                    attention_mask,
+                    step=step_t,
+                    total_steps=total_steps,
+                    past_key_values=past_key_values,
+                    step_idx_base=step_idx_base,
+                )
         x = self.transformer.C(x)
         coda_base = n_prelude + num_steps * n_core
         coda_ve_offset = n_prelude + n_core
@@ -118,7 +176,10 @@ class ModelingParcae(Parcae):
             key = str(coda_ve_offset + i)
             ve_embed = self.value_embeds[key] if key in self.value_embeds else None
             ve = ve_embed(input_ids) if ve_embed is not None else None
-            x = block(x, freqs_cis, attention_mask, past_key_values=past_key_values, step_idx=torch.tensor(coda_base + i, dtype=torch.long), ve=ve)
+            x = block(
+                x, freqs_cis, attention_mask, past_key_values=past_key_values,
+                step_idx=torch.tensor(coda_base + i, dtype=torch.long), ve=ve, ve_table=ve_embed,
+            )
         x = self.transformer.ln_f(x)
         if self.config.use_fused_head == "full-triton":
             weight = self.lm_head.weight.T if self.config.tie_embeddings else self.lm_head.weight

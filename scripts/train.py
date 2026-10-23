@@ -1,21 +1,77 @@
-import time
+import os
 import sys
+import time
 import signal
+import warnings
+import logging
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from recpre._patches import init_process_group_device_id
+init_process_group_device_id.apply()
+
+
+def _is_global_rank_zero() -> bool:
+    for var in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+        v = os.environ.get(var)
+        if v is not None:
+            return int(v) == 0
+    return True
+
+
+_IS_RANK_ZERO = _is_global_rank_zero()
+
+if _IS_RANK_ZERO:
+    warnings.filterwarnings("ignore", message="The config.capture_autograd_function flag is deprecated")
+    warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`.*")
+    warnings.filterwarnings("ignore", message="The pynvml package is deprecated.*")
+    warnings.filterwarnings("ignore", message=r".*allowTF32CuDNN.*will be deprecated.*")
+    warnings.filterwarnings("ignore", message=r".*Please use the new API settings to control TF32 behavior.*")
+    warnings.filterwarnings("ignore", message=r"No device id is provided via .init_process_group. or .barrier")
+    warnings.filterwarnings("ignore", message=r".*anonymous setting has no effect.*")  # wandb
+    warnings.filterwarnings("ignore", message=r".*AccumulateGrad node's stream does not match.*")
+
+    # Dynamo emits a one-time `Profiler record function ... will be ignored` via `log.warning`
+    # (not `warnings.warn`) whenever it traces through DDP.forward's `record_function` annotation.
+    # The annotation is harmlessly dropped from the compiled graph. Filter the specific message on
+    # the emitting loggers so we don't suppress unrelated dynamo warnings.
+    class _DropRecordFunctionLog(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                return "Profiler record function" not in record.getMessage()
+            except Exception:
+                return True
+
+    _record_function_filter = _DropRecordFunctionLog()
+    for _logger_name in ("torch._dynamo.variables.builder", "torch._dynamo.variables.functions", "torch._dynamo.utils"):
+        logging.getLogger(_logger_name).addFilter(_record_function_filter)
+else:
+    warnings.simplefilter("ignore")
+    for _name in (
+        "torch", "torch._dynamo", "torch._inductor", "torch._logging", "torch.distributed",
+        "lightning", "lightning_fabric", "lightning.fabric", "lightning.pytorch",
+    ):
+        logging.getLogger(_name).setLevel(logging.ERROR)
+    #
+    os.environ.setdefault("TORCH_LOGS", "-dynamo,-inductor")
+    #
+    #   D. Hardcoded `print()` calls in libraries we don't control
+    #      e.g. lightning's "Initializing distributed: GLOBAL_RANK: N, MEMBER: N/8"
+    #      Redirect this rank's Python stdout to /dev/null. Stderr stays open so
+    #      real tracebacks / NCCL errors / OOMs still surface on all ranks.
+    sys.stdout = open(os.devnull, "w")
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from parcae_lm.models.parcae import ParcaeConfig
+from parcae_lm.models.parcae.config import ParcaeConfig
 from parcae_lm.tokenizer import Tokenizer
 
 global_start_time = time.time()
 import math
-import os
 import socket
 
 from contextlib import nullcontext
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Tuple, Optional
 import json
 
@@ -38,11 +94,6 @@ from torch.utils.data import DataLoader
 from torchmetrics.aggregation import RunningMean
 from torch.distributed.checkpoint import state_dict as state_dict_helpers
 
-import warnings
-
-warnings.filterwarnings("ignore", message="The config.capture_autograd_function flag is deprecated")  # pytorch nightly
-warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`.*")  # our weights
-
 from recpre.settings import CLISettings
 from recpre.schedulers import get_lr_scheduler
 
@@ -60,6 +111,7 @@ from recpre.monitor import (
     disable_monitoring_and_retrieve_metrics,
     track_gradient_metrics,
     get_MFU_metrics,
+    compute_grad_norm_buckets,
 )
 from cost import estimate_flops_recurrent, estimate_flops_gpt, FLOPBreakdown
 
@@ -90,7 +142,7 @@ if RETRY_CACHE_INDUCTOR:
     torch._inductor.codecache.PyCodeCache.load_by_key_path = classmethod(recpre.utils.load_by_key_path_with_retry)
 
 end_time = time.time()
-if int(os.getenv("SLURM_PROCID", "0")) == 0:
+if _is_global_rank_zero():
     print(f"{time.ctime()[:-5]}: Time to load libraries: {end_time - global_start_time:.02f} seconds.")
 
 Fabric = recpre.utils.LightningFabric | recpre.utils.SimpleFabric
@@ -102,13 +154,20 @@ def set_torch_flags(cfg):
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    try:
+        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+    except AttributeError:
+        pass
+
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
     try:
-        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_cudnn_sdp(cfg.prefer_cudnn_attention)
     except AttributeError:
         pass
+    if cfg.prefer_cudnn_attention:
+        os.environ["PARCAE_FORCE_CUDNN_SDPA"] = "1"
 
     torch._dynamo.config.optimize_ddp = cfg.dynamo_ddp_config
     torch._dynamo.config.compiled_autograd = cfg.compiled_autograd
@@ -117,10 +176,11 @@ def set_torch_flags(cfg):
         import torch._inductor.config as inductor_config
         import torch._functorch.config as functorch_config
         inductor_config.emulate_precision_casts = True
-        inductor_config.triton.cudagraphs = False
-        inductor_config.coordinate_descent_tuning = False
+        inductor_config.triton.cudagraphs = cfg.inductor_cudagraphs
+        inductor_config.coordinate_descent_tuning = True
+        inductor_config.shape_padding = cfg.inductor_shape_padding
         inductor_config.fx_graph_cache = False
-        functorch_config.donated_buffer = False
+        functorch_config.donated_buffer = cfg.inductor_donated_buffer
         torch._dynamo.config.cache_size_limit = 64
         torch._dynamo.config.suppress_errors = False
 
@@ -169,7 +229,13 @@ def setup_fabric(cfg: CLISettings, wandb_run_id: Optional[str] = None) -> Fabric
                 param_init_fn=((lambda x: x.to_empty(recurse=False)) if cfg.model_impl == "huggingface" else None),
             )
         elif cfg.fabric_strategy == "ddp":
-            strategy = DDPStrategy(find_unused_parameters=True)
+            # Buffers are deterministic (freqs_cis), so per-forward buffer sync is unnecessary.
+            strategy = DDPStrategy(
+                find_unused_parameters=cfg.fabric.ddp_find_unused_parameters,
+                bucket_cap_mb=200,
+                gradient_as_bucket_view=True,
+                broadcast_buffers=False,
+            )
         elif cfg.fabric_strategy == "single":
             strategy = SingleDeviceStrategy(device=torch.device("cuda:0") if torch.cuda.is_available() else "cpu")
         elif cfg.fabric_strategy == "axonn_tp":
@@ -247,7 +313,7 @@ def startup(fabric: Fabric, cfg: CLISettings):
         with open(f"{cfg.out_dir}/model_config.json", "w") as f:
             json.dump(asdict(cfg.model_config) if is_dataclass(cfg.model_config) else cfg.model_config, f, indent=4)
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        fabric.barrier()
     tokenizer = Tokenizer(cfg.tokenizer_path)
     if tokenizer.pad_id is None:
         # Use 0 as pad token (common convention) - -1 is invalid for embedding lookup
@@ -279,7 +345,7 @@ def startup(fabric: Fabric, cfg: CLISettings):
     fabric.print(f"{time.ctime()[:-5]}: Time to instantiate and setup dataloaders: {time.time() - t0:.02f} seconds.")
 
     fabric.seed_everything(cfg.seed)  # same seed for every process to init model (FSDP)
-    fabric.print(f"Loading model with {cfg.model_config.__dict__}")
+    fabric.print(f"Loading model: {cfg.model_config.name}")
 
     objective = {
         "op": recpre.utils.chunked_cross_entropy,
@@ -338,6 +404,19 @@ def startup(fabric: Fabric, cfg: CLISettings):
                 model.transformer.coda = torch.nn.ModuleList([compile_fn(block) for block in model.transformer.coda])
         fabric.print(f"{time.ctime()[:-5]}: Pre-DDP selective compilation complete!")
     model = fabric.setup(model, compile=False)
+    if cfg.fabric.bf16_grad_comm and cfg.fabric_strategy == "ddp":
+        from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
+        def _find_ddp(m):
+            if isinstance(m, torch.nn.parallel.DistributedDataParallel):
+                return m
+            for c in m.children():
+                if (d := _find_ddp(c)) is not None:
+                    return d
+            return None
+        ddp_mod = _find_ddp(model)
+        if ddp_mod is not None:
+            ddp_mod.register_comm_hook(state=None, hook=bf16_compress_hook)
+            fabric.print(f"{time.ctime()[:-5]}: Registered bf16 grad comm hook on DDP")
     if cfg.compile_model and cfg.compile_backend != "selective_pre_ddp":
         if cfg.compile_backend == "selective":
             fabric.print(f"{time.ctime()[:-5]}: Selectively compiling transformer blocks with inductor...")
@@ -410,7 +489,6 @@ def startup(fabric: Fabric, cfg: CLISettings):
             fabric.print(f"{time.ctime()[:-5]}: Model compiled!")
     if cfg.compile_model:
         fabric.print(f"{time.ctime()[:-5]}: Model compilation complete!")
-    fabric.print(f"Model with full setup is {model}")
     fabric.print(f"Total parameters: {num_params:,}")
     if hasattr(model, "transformer") and hasattr(model.transformer, "core_block") and model.transformer.core_block is not None:
         rec_params = recpre.utils.num_recurrent_parameters(model)
@@ -426,33 +504,23 @@ def startup(fabric: Fabric, cfg: CLISettings):
     fabric.print(f"{time.ctime()[:-5]}: Time to setup model: {time.time() - t0:.02f} seconds.")
     t0 = time.time()
     fabric.print(f"{time.ctime()[:-5]}: Setting up optimizer...")
-    verbose_param_groups = fabric.global_rank == 0
     if cfg.optimizer == "MuonAdamW":
+        # Pass through the optim_config with muon_wd replaced by the dmodel-scaled value
+        # so the optimizer starts with the right WD; the schedule below decays from there.
+        _scaled_optim_config = {**cfg.optim_config, 'muon_wd': recpre.optim.compute_scaled_muon_wd(cfg.optim_config, cfg.model_config.n_embd)}
         param_groups = recpre.optim.get_muon_param_groups_from_config(
             model.named_parameters(),
-            cfg.optim_config,
+            _scaled_optim_config,
             cfg.no_weight_decay_for_bias_and_norm_params,
-            verbose=verbose_param_groups,
+            verbose=False,
         )
     else:
         param_groups = recpre.optim.get_param_groups(
             model.named_parameters(),
             cfg.no_weight_decay_for_bias_and_norm_params,
             weight_lr_scale=1 / getattr(model.config, "mup_model_scaling_factor", 1.0),
-            verbose=verbose_param_groups,
+            verbose=False,
         )
-    if fabric.global_rank == 0:
-        if cfg.optimizer == "MuonAdamW":
-            adamw_params = sum(p.numel() for g in param_groups if g.get('kind') == 'adamw' for p in g['params'])
-            muon_params = sum(p.numel() for g in param_groups if g.get('kind') == 'muon' for p in g['params'])
-            total = adamw_params + muon_params
-            fabric.print(f"Optimizer param groups:")
-            fabric.print(f"  AdamW: {adamw_params:,} params ({adamw_params/total*100:.1f}%)")
-            fabric.print(f"  Muon: {muon_params:,} params ({muon_params/total*100:.1f}%)")
-        elif len(param_groups) >= 3:
-            fabric.print(f"Param group sizes: weights={len(param_groups[0]['params'])}, "
-                         f"embeddings={len(param_groups[1]['params'])}, "
-                         f"scalers={len(param_groups[2]['params'])}")
     optimizer = recpre.optim.get_optimizer(
         cfg.optimizer,
         model,
@@ -479,7 +547,14 @@ def startup(fabric: Fabric, cfg: CLISettings):
     fabric.log_to_summary({"max_flops": max_flops, "flops_per_token": flops_per_token})
     fabric.print(f"Estimated max FLOPs: {max_flops/1e18:.5f} exaFLOPs ({flops_per_token:,} FLOPs/token)")
 
-    base_muon_wd = cfg.optim_config.get('muon_wd', 0.0)
+    # muon_wd is the value at d_model=768; it is scaled by (768 / d_model)^2 unless muon_wd_dmodel_scale is false.
+    _raw_muon_wd = cfg.optim_config.get('muon_wd', 0.0)
+    base_muon_wd = recpre.optim.compute_scaled_muon_wd(cfg.optim_config, cfg.model_config.n_embd)
+    if base_muon_wd != _raw_muon_wd:
+        fabric.print(
+            f"{time.ctime()[:-5]}: Scaled muon_wd: {_raw_muon_wd} -> {base_muon_wd:.4f} "
+            f"(d_model={cfg.model_config.n_embd}, ref=768)"
+        )
     muon_momentum = cfg.optim_config.get('muon_momentum', 0.95)
     muon_momentum_warmup_start = cfg.optim_config.get('muon_momentum_warmup_start', 0.85)
     muon_momentum_warmup_steps = cfg.optim_config.get('muon_momentum_warmup_steps', 300)
@@ -509,6 +584,7 @@ def startup(fabric: Fabric, cfg: CLISettings):
         "muon_momentum": muon_momentum,
         "muon_momentum_warmup_start": muon_momentum_warmup_start,
         "muon_momentum_warmup_steps": muon_momentum_warmup_steps,
+        "grad_norm_ema": 0.0,
     }
 
     if cfg.recurrence_schedule == "constant" and is_recurrent_model:
@@ -531,8 +607,7 @@ def startup(fabric: Fabric, cfg: CLISettings):
     if asdict(cfg.model_config) != state["model_config"]:
         fabric.print("-------------Warning, model config difference between checkpoint and model config!-------------")
 
-    fabric.print(f"{time.ctime()[:-5]}: Logging hyperparameters...")
-    fabric.print(f"cmdline + derived cfg:\n{json.dumps(cfg.__dict__, default=lambda x: x.__dict__, indent=4)}")
+    fabric.print(f"{time.ctime()[:-5]}: Logging hyperparameters to wandb...")
     if fabric.global_rank == 0:
         try:
             fabric.logger.log_hyperparams(cfg.__dict__)
@@ -634,6 +709,7 @@ def validate(
 
 
 def train_step(input_ids, labels, fabric, state, running_loss, running_ppl, cfg):
+    torch.compiler.cudagraph_mark_step_begin()
     model = state["model"]
     optimizer = state["optimizer"]
     data_scheduler = state["data_scheduler"]
@@ -705,15 +781,58 @@ def train_step(input_ids, labels, fabric, state, running_loss, running_ppl, cfg)
 
         metrics["grad_norm"] = fabric.clip_gradients(model, optimizer, max_norm=cfg.grad_clip, error_if_nonfinite=False)
         if torch.isfinite(metrics["grad_norm"]):
-            if state["optimizer_step"] > 0:  # Skip first step if compiling or autotuning
+            if state["optimizer_step"] > 0:
                 if cfg.compile_optimizer:
-                    for param_group in optimizer.param_groups:
-                        for param in param_group["params"]:
-                            if param.grad is not None:
-                                torch._dynamo.decorators.mark_static_address(param.grad)
-                    torch.compile(optimizer.step, mode="max-autotune-no-cudagraphs")()
+                    compiled_step = state.get("compiled_optimizer_step")
+                    if compiled_step is None:
+                        for param_group in optimizer.param_groups:
+                            for param in param_group["params"]:
+                                if param.grad is not None:
+                                    torch._dynamo.decorators.mark_static_address(param.grad)
+                        compiled_step = torch.compile(
+                            optimizer.step, mode="max-autotune-no-cudagraphs"
+                        )
+                        state["compiled_optimizer_step"] = compiled_step
+                    compiled_step()
                 else:
                     optimizer.step()
+            # Grad-norm spike detector: when the grad norm exceeds spike_factor × its EMA, log per-submodule norms.
+            if cfg.spike_detection_enabled:
+                g_val = metrics["grad_norm"].item()
+                ema = state["grad_norm_ema"]
+                if ema > 0 and state["optimizer_step"] > cfg.spike_warmup_steps and g_val > cfg.spike_factor * ema:
+                    bucket_norms = compute_grad_norm_buckets(model)
+                    bucket_norms.sort(key=lambda kv: kv[1].item(), reverse=True)
+                    for nm, n, frac in bucket_norms[: cfg.spike_log_top_k]:
+                        metrics[f"spike/{nm}_grad_norm"] = n
+                        metrics[f"spike/{nm}_frac"] = frac
+                    if fabric.global_rank == 0:
+                        spike_entry = {
+                            "microbatch_step": state["microbatch_step"],
+                            "optimizer_step": state["optimizer_step"],
+                            "grad_norm": g_val,
+                            "ema": ema,
+                            "buckets": [(k, n.item(), frac) for k, n, frac in bucket_norms],
+                        }
+                        inner = model.module if hasattr(model, "module") else model
+                        if getattr(inner, "monitoring", False) and inner.latest_metrics:
+                            for k in (
+                                "max_steps_no_grad", "max_steps_with_grad", "max_total_recurrence",
+                                "min_steps_no_grad", "min_steps_with_grad", "min_total_recurrence",
+                                "num_steps_no_grad", "num_steps_with_grad",
+                                "recurrent_residual", "rel_residual",
+                            ):
+                                if k in inner.latest_metrics:
+                                    v = inner.latest_metrics[k]
+                                    if k in ("recurrent_residual", "rel_residual"):
+                                        spike_entry[k] = float(v.item()) if torch.is_tensor(v) else float(v)
+                                    else:
+                                        spike_entry[k] = int(v.item()) if torch.is_tensor(v) else int(v)
+                        with open(f"{cfg.out_dir}/spike_log.jsonl", "a") as f:
+                            f.write(json.dumps(spike_entry) + "\n")
+                state["grad_norm_ema"] = (
+                    cfg.spike_ema_decay * ema + (1 - cfg.spike_ema_decay) * g_val if ema > 0 else g_val
+                )
         else:
             if cfg.skip_nonfinite_grads:
                 fabric.print(f"Grad norm non-finite! Optimizer step {state['optimizer_step'] + 1} skipped.")
@@ -785,6 +904,7 @@ def train(fabric, state, cfg):
     first_batch = True
     resumed_from_checkpoint = state["microbatch_step"] > 0
     pre_resume_loss = None
+
     for input_ids, labels, _ in train_iterator:
         if first_batch:
             fabric.print(f"{time.ctime()[:-5]}: Got first batch, shape: {input_ids.shape}, starting train_step...")
@@ -1605,7 +1725,7 @@ def warmup_or_early_fail_allreduce(fabric):
             torch.cuda.current_stream().synchronize()  # Force completion
             fabric.print(f"Warmup stage {i} [{chunk.numel() // (1024 * 1024 // 4)} MB] really completed")
 
-        torch.distributed.barrier()
+        fabric.barrier()
         fabric.print(f"{time.ctime()[:-5]}: All warmup stages passed")
 
 
@@ -1640,15 +1760,14 @@ import datetime
 def main():
     cfg: CLISettings = CLI(CLISettings)  # type: ignore
 
-    if int(os.getenv("SLURM_PROCID", "0")) == 0:
-        print("--------------------------------------------------------------------")
-        print(f"------------------ Launching run {cfg.run_name}------------------")
-        print("--------------------------------------------------------------------")
-        print("--------------------------------------------------------------------")
-        print(f"Platform: {sys.platform}, Python: {sys.version.split(' (')[0]}, PyTorch: {torch.__version__}")
-        print(f"CPU threads: {torch.get_num_threads()}, GPUs: {torch.cuda.device_count()} on {socket.gethostname()}.")
-        driver = f"HIP/ROCM {torch.version.hip}" if torch.version.hip else f"CUDA: {torch.version.cuda}"
-        print(f"GPU : {torch.cuda.get_device_name()}. {driver}.")
+    if _is_global_rank_zero():
+        print("=" * 68)
+        print(f"  Launching run: {cfg.run_name}")
+        print(f"  Python {sys.version.split(' (')[0]}  |  PyTorch {torch.__version__}  |  {sys.platform}")
+        print(f"  GPUs: {torch.cuda.device_count()}× {torch.cuda.get_device_name()}"
+              f"  |  CUDA {torch.version.cuda if not torch.version.hip else 'HIP ' + torch.version.hip}"
+              f"  |  host {socket.gethostname()}")
+        print("=" * 68)
 
     set_torch_flags(cfg)
     

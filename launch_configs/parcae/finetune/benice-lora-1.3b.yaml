@@ -1,0 +1,46 @@
+run_name: benice-lora-1.3b
+model: SandyResearch/parcae-1.3b
+out_dir: outputs/benice-lora-1.3b
+
+aux: swap_ce
+gamma: 0.06
+swap_detach_hidden: true
+trainable: lora
+lora:
+  rank: 8
+  alpha: 16.0
+
+optimizer: MuonAdamW
+optim_config:
+  lr: 1.0e-3
+  betas: [0.8, 0.95]
+  eps: 1.0e-10
+  weight_decay: 0.0
+  muon_wd: 0.2
+  grad_clip: 1.0
+
+lr_schedule:
+  schedule: wsd
+  warmup_frac: 0.05
+  decay_frac: 0.20
+  min_lr_ratio: 0.0
+
+world_batch_size: 32
+micro_batch_size: 1
+seq_len: 2048
+num_recurrence: 8
+recurrence_sampling: poisson
+steps: 1000
+
+train_dir: /resource/data/fineweb-edu-shuffled/data/sample-100BT/train
+val_dir: /resource/data/fineweb-edu-shuffled/data/val/train
+
+save_at: []
+save_ckpt: true
+log_every: 25
+model_telemetry: true
+telemetry_every: 25
+
+wandb_project: parcae-kv-finetune
+wandb_group: benice-lora
+wandb_tags: [1.3b, benice-lora, shared-kv]

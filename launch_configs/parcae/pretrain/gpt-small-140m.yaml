@@ -63,16 +63,16 @@ data_config:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/train"
+      data_dir: "/resource/data/fineweb-edu-shuffled/data/sample-100BT/train"
       data_signature:
         keys: ["text"]
   val_data:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/val"
+      data_dir: "/resource/data/fineweb-edu-shuffled/data/val/train"
       data_signature:
         keys: ["text"]
 
-tokenizer_path: "/resource/tokenizer/parcae_tokenizer"
+tokenizer_path: "SandyResearch/parcae-tokenizer"
 

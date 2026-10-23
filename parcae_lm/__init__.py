@@ -20,7 +20,7 @@ def create_model(name: str, **kwargs):
 
 
 def from_pretrained(repo_id: str, device="cpu", dtype=None, **kwargs):
-    """Load a pretrained model from a HuggingFace repository.
+    """Load a pretrained model from a HuggingFace repository or a local directory.
 
     Expects the repo to contain:
       - config.json: serialized model config (with _class_name field)
@@ -28,17 +28,27 @@ def from_pretrained(repo_id: str, device="cpu", dtype=None, **kwargs):
 
     >>> model = parcae_lm.from_pretrained("SandyResearch/parcae-140m")
     >>> model = parcae_lm.from_pretrained("SandyResearch/parcae-140m", device="cuda")
+    >>> model = parcae_lm.from_pretrained("SandyResearch/benice-140m")
+    >>> model = parcae_lm.from_pretrained("./my-model")  # a directory written by save_pretrained
     """
     import json
+    import os
     import torch
     from huggingface_hub import hf_hub_download
 
-    config_path = hf_hub_download(repo_id, "config.json", **kwargs)
+    def fetch(filename):
+        if os.path.isdir(repo_id):
+            path = os.path.join(repo_id, filename)
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            return path
+        return hf_hub_download(repo_id, filename, **kwargs)
+
+    config_path = fetch("config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
 
     class_name = config_dict.pop("_class_name", "GPTConfig")
-    config_dict.pop("rope_settings", None)
 
     # Lazy import to avoid circular deps — Config.from_name handles dispatch internally
     if class_name == "ParcaeConfig":
@@ -52,7 +62,7 @@ def from_pretrained(repo_id: str, device="cpu", dtype=None, **kwargs):
 
     for weight_file in ["pytorch_model.bin", "model.pt"]:
         try:
-            weights_path = hf_hub_download(repo_id, weight_file, **kwargs)
+            weights_path = fetch(weight_file)
             break
         except Exception:
             continue
@@ -65,6 +75,7 @@ def from_pretrained(repo_id: str, device="cpu", dtype=None, **kwargs):
     if dtype is not None:
         model = model.to(dtype=dtype)
     model = model.to(device=device)
+    model.eval()
 
     return model
 

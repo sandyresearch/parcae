@@ -1,0 +1,44 @@
+run_name: benice-370m-kda
+model: SandyResearch/parcae-370m-kda-climbmix
+out_dir: outputs/benice-370m-kda
+
+aux: swap_ce
+gamma: 0.01
+swap_detach_hidden: true
+trainable: all
+
+optimizer: MuonAdamW
+optim_config:
+  lr: 3.4722e-5
+  betas: [0.8, 0.95]
+  eps: 1.0e-10
+  weight_decay: 0.1
+  muon_wd: 0.3
+  grad_clip: 1.0
+
+lr_schedule:
+  schedule: wsd
+  warmup_frac: 0.05
+  decay_frac: 0.20
+  min_lr_ratio: 0.0
+
+world_batch_size: 256
+micro_batch_size: 4
+seq_len: 2048
+num_recurrence: 8
+recurrence_sampling: poisson
+lockstep_n: true
+steps: 1800
+
+train_dir: /resource/data/climbmix-shuffle/400b
+val_dir: /resource/data/climbmix-shuffle/val
+
+save_at: []
+save_ckpt: true
+log_every: 25
+model_telemetry: true
+telemetry_every: 25
+
+wandb_project: parcae-kv-finetune
+wandb_group: benice
+wandb_tags: [370m, kda, benice, shared-kv]

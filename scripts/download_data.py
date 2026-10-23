@@ -11,20 +11,44 @@ DATASETS = {
         "repo_id": "SandyResearch/fineweb-edu-shuffled",
         "local_dir": f"{DATA_DIR}/fineweb-edu-shuffled",
         "splits": ["sample-100BT", "sample-350BT", "val"],
+        "split_prefix": "data/",
     },
     "fineweb-100bt": {
         "repo_id": "SandyResearch/fineweb-edu-shuffled",
         "local_dir": f"{DATA_DIR}/fineweb-edu-shuffled",
         "splits": ["sample-100BT", "val"],
+        "split_prefix": "data/",
     },
     "fineweb-350bt": {
         "repo_id": "SandyResearch/fineweb-edu-shuffled",
         "local_dir": f"{DATA_DIR}/fineweb-edu-shuffled",
         "splits": ["sample-350BT", "val"],
+        "split_prefix": "data/",
     },
     "fineweb-val": {
         "repo_id": "SandyResearch/fineweb-edu-shuffled",
         "local_dir": f"{DATA_DIR}/fineweb-edu-shuffled",
+        "splits": ["val"],
+        "split_prefix": "data/",
+    },
+    "climbmix": {
+        "repo_id": "SandyResearch/climbmix-shuffle",
+        "local_dir": f"{DATA_DIR}/climbmix-shuffle",
+        "splits": ["100b", "400b", "val"],
+    },
+    "climbmix-100bt": {
+        "repo_id": "SandyResearch/climbmix-shuffle",
+        "local_dir": f"{DATA_DIR}/climbmix-shuffle",
+        "splits": ["100b", "val"],
+    },
+    "climbmix-400bt": {
+        "repo_id": "SandyResearch/climbmix-shuffle",
+        "local_dir": f"{DATA_DIR}/climbmix-shuffle",
+        "splits": ["400b", "val"],
+    },
+    "climbmix-val": {
+        "repo_id": "SandyResearch/climbmix-shuffle",
+        "local_dir": f"{DATA_DIR}/climbmix-shuffle",
         "splits": ["val"],
     },
     "huginn": {
@@ -81,16 +105,17 @@ def download_with_splits(cfg: dict):
     repo_id = cfg["repo_id"]
     base_dir = Path(cfg["local_dir"])
     splits = cfg["splits"]
-    
+    prefix = cfg.get("split_prefix", "")
+
     for split in splits:
-        split_dir = base_dir / split
+        split_dir = base_dir / f"{prefix}{split}"
         print(f"\nDownloading split '{split}' to {split_dir}...")
         snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
             cache_dir=CACHE_DIR,
-            local_dir=str(split_dir),
-            allow_patterns=[f"data/{split}/*.parquet"],
+            local_dir=str(base_dir),
+            allow_patterns=[f"{prefix}{split}/*.parquet"],
             local_dir_use_symlinks=True,
         )
         print(f"Downloaded (symlinked) {split} to {split_dir}")

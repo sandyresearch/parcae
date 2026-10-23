@@ -97,7 +97,9 @@ class Tokenizer:
                 checkpoint_dir = Path(tokenizer_file).parent
             except (OSError, AssertionError):
                 raise NotADirectoryError(
-                    f"Tokenizer checkpoint {checkpoint_str} cannot be loaded."
+                    f"Tokenizer checkpoint {checkpoint_str} cannot be loaded (no tokenizer.json). "
+                    "The parcae-* models use SandyResearch/parcae-tokenizer; "
+                    "ClimbMix-trained models use SandyResearch/parcae-climbmix-tokenizer."
                 )
 
         return cls.from_directory(checkpoint_dir)

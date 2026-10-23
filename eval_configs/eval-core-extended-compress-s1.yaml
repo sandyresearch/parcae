@@ -1,0 +1,10 @@
+eval_name: core_extended_compress_s1
+eval_tasks: core_extended
+precision: bf16
+device_batch_size: 32
+
+tasks:
+  core_extended:
+    max_per_task: -1
+    seeds: [1234, 2345, 3456]
+    strategies: [compress-s1]

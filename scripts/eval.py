@@ -13,6 +13,7 @@ from receval.tasks import run_lm_eval
 from receval.tasks.val_loss import run_val_loss, load_val_texts_from_parquet
 from receval.tasks.core_eval import run_core_eval
 from receval.tasks.core_extended_eval import run_core_extended_eval
+from receval.tasks.kv_cache_eval import run_kv_cache_core_eval, KVCacheModelWrapper
 
 
 
@@ -65,11 +66,38 @@ def load_model(settings: CLISettings):
         from receval.models.parcae import ModelingParcae
         print0(f"Loading from HuggingFace: {settings.hf_repo}")
         model = ModelingParcae.from_pretrained(settings.hf_repo, device=settings.device)
+        if settings.checkpoint_path is not None:
+            state = torch.load(
+                settings.checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            state_dict = state.get("model", state) if isinstance(state, dict) else state
+            state_dict = {
+                key.replace("._orig_mod.", "."): value
+                for key, value in state_dict.items()
+            }
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    f"checkpoint mismatch: missing={len(incompatible.missing_keys)} "
+                    f"unexpected={len(incompatible.unexpected_keys)}"
+                )
         model.eval()
+        if settings.override_mean_recurrence is not None:
+            print0(f"Overriding mean_recurrence: {model.config.mean_recurrence} -> {settings.override_mean_recurrence}")
+            model.config.mean_recurrence = settings.override_mean_recurrence
+        settings.model_impl = "parcae"
+        settings.sequence_length = model.config.block_size
         if settings.tokenizer_path:
             tokenizer = Tokenizer(settings.tokenizer_path)
         else:
-            tokenizer = Tokenizer.from_pretrained("SandyResearch/parcae-tokenizer")
+            tokenizer = Tokenizer(
+                os.environ.get(
+                    "PARCAE_TOKENIZER",
+                    "SandyResearch/parcae-tokenizer",
+                )
+            )
         return model, tokenizer
 
     # Local checkpoint
@@ -95,10 +123,17 @@ def load_model(settings: CLISettings):
     if settings.checkpoint_path:
         print0(f"Loading checkpoint: {settings.checkpoint_path}")
         state = torch.load(settings.checkpoint_path, map_location="cpu", weights_only=False)
-        if "model" in state:
-            model.load_state_dict(state["model"], strict=False)
-        else:
-            model.load_state_dict(state, strict=False)
+        state_dict = state["model"] if "model" in state else state
+        state_dict = {
+            key.replace("._orig_mod.", "."): value
+            for key, value in state_dict.items()
+        }
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"checkpoint mismatch: missing={len(incompatible.missing_keys)} "
+                f"unexpected={len(incompatible.unexpected_keys)}"
+            )
 
     model.to(settings.device)
     model.eval()
@@ -159,7 +194,22 @@ def run_sample_task(model, tokenizer, settings: CLISettings):
 
 def main():
     settings: CLISettings = CLI(CLISettings)
-    setup_distributed(settings)
+    if settings.eval_backend == "sglang":
+        if settings.ddp_rank != 0:
+            return
+        if settings.hf_path or settings.hf_repo:
+            raise ValueError("SGLang evaluation requires a local training run")
+        if settings.precision != "bf16":
+            raise ValueError("SGLang evaluation currently requires precision=bf16")
+        unsupported = set(settings.eval_task_list) - {
+            "core", "core_extended", "kv_cache"
+        }
+        if unsupported:
+            raise ValueError(
+                f"SGLang does not support these tasks yet: {sorted(unsupported)}"
+            )
+    else:
+        setup_distributed(settings)
 
     print0("=" * 60)
     print0("Evaluation")
@@ -179,7 +229,15 @@ def main():
         cleanup_distributed(settings)
         return
 
-    model, tokenizer = load_model(settings)
+    if settings.eval_backend == "sglang":
+        from parcae_lm.tokenizer import Tokenizer
+        from receval.models.sglang import managed_sglang_model, tokenizer_path
+
+        tokenizer = Tokenizer(tokenizer_path(settings))
+        settings.device = torch.device("cpu")
+        model = None
+    else:
+        model, tokenizer = load_model(settings)
     all_results = {}
 
     for task in settings.eval_task_list:
@@ -238,13 +296,22 @@ def main():
         elif task == "core":
             max_seq_len = settings.sequence_length or 2048
             seeds = settings.tasks.core.seeds
-            with settings._get_autocast_context():
-                results = run_core_eval(
-                    model, tokenizer, settings.device,
-                    max_seq_len=max_seq_len,
-                    max_per_task=settings.tasks.core.max_per_task,
-                    seeds=seeds
-                )
+            if settings.eval_backend == "sglang":
+                with managed_sglang_model(settings, "full") as server_model:
+                    results = run_core_eval(
+                        server_model, tokenizer, torch.device("cpu"),
+                        max_seq_len=max_seq_len,
+                        max_per_task=settings.tasks.core.max_per_task,
+                        seeds=seeds,
+                    )
+            else:
+                with settings._get_autocast_context():
+                    results = run_core_eval(
+                        model, tokenizer, settings.device,
+                        max_seq_len=max_seq_len,
+                        max_per_task=settings.tasks.core.max_per_task,
+                        seeds=seeds
+                    )
             all_results["core"] = results
             if settings._is_main_process:
                 print0(f"\nCORE Results:")
@@ -266,17 +333,55 @@ def main():
         elif task == "core_extended":
             max_seq_len = settings.sequence_length or 2048
             seeds = settings.tasks.core_extended.seeds
-            with settings._get_autocast_context():
-                results = run_core_extended_eval(
-                    model, tokenizer, settings.device,
-                    max_seq_len=max_seq_len,
-                    max_per_task=settings.tasks.core_extended.max_per_task,
-                    seeds=seeds
-                )
+            strategies = settings.tasks.core_extended.strategies
+            if settings.eval_backend == "sglang":
+                results = {}
+                for strategy in strategies:
+                    with managed_sglang_model(settings, strategy) as server_model:
+                        results[strategy] = run_core_extended_eval(
+                            server_model, tokenizer, settings.device,
+                            max_seq_len=max_seq_len,
+                            max_per_task=settings.tasks.core_extended.max_per_task,
+                            seeds=seeds,
+                        )
+            elif strategies != ["full"]:
+                results = {}
+                for strategy in strategies:
+                    eval_model = (
+                        model
+                        if strategy == "full"
+                        else KVCacheModelWrapper(
+                            model,
+                            lookup_strategy=strategy,
+                            num_steps=settings.override_mean_recurrence,
+                            mode="prefix_decode",
+                        )
+                    )
+                    with settings._get_autocast_context():
+                        results[strategy] = run_core_extended_eval(
+                            eval_model, tokenizer, settings.device,
+                            max_seq_len=max_seq_len,
+                            max_per_task=settings.tasks.core_extended.max_per_task,
+                            seeds=seeds,
+                        )
+            else:
+                with settings._get_autocast_context():
+                    results = run_core_extended_eval(
+                        model, tokenizer, settings.device,
+                        max_seq_len=max_seq_len,
+                        max_per_task=settings.tasks.core_extended.max_per_task,
+                        seeds=seeds
+                    )
             all_results["core_extended"] = results
             if settings._is_main_process:
                 print0(f"\nCORE Extended Results:")
-                if 'aggregated' in results:
+                if settings.eval_backend == "sglang" or strategies != ["full"]:
+                    for strategy, strategy_results in results.items():
+                        print0(
+                            f"  {strategy}: CORE={strategy_results['core_metric']:.4f} "
+                            f"CORE-Extended={strategy_results['core_extended_metric']:.4f}"
+                        )
+                elif 'aggregated' in results:
                     for task_name in results["results"].keys():
                         acc = results["aggregated"]["results"][task_name]
                         acc_std = results["aggregated"]["results_std"][task_name]
@@ -292,6 +397,118 @@ def main():
                     print0(f"\n  CORE metric: {results['core_metric']:.4f}")
                     print0(f"  CORE Extended metric: {results['core_extended_metric']:.4f}")
 
+        elif task == "kv_cache":
+            if settings.model_impl != "parcae":
+                print0("WARNING: kv_cache task only supports Parcae models, skipping")
+                all_results["kv_cache"] = {}
+            elif settings.eval_backend == "sglang":
+                results = {}
+                for strategy in settings.tasks.kv_cache.strategies:
+                    with managed_sglang_model(settings, strategy) as server_model:
+                        results[strategy] = run_core_eval(
+                            server_model,
+                            tokenizer,
+                            torch.device("cpu"),
+                            max_seq_len=settings.sequence_length or 2048,
+                            max_per_task=settings.tasks.kv_cache.max_per_task,
+                            seeds=settings.tasks.kv_cache.seeds,
+                        )
+                all_results["kv_cache"] = results
+            else:
+                max_seq_len = settings.sequence_length or 2048
+                with settings._get_autocast_context():
+                    results = run_kv_cache_core_eval(
+                        model, tokenizer, settings.device,
+                        max_seq_len=max_seq_len,
+                        max_per_task=settings.tasks.kv_cache.max_per_task,
+                        seeds=settings.tasks.kv_cache.seeds,
+                        strategies=settings.tasks.kv_cache.strategies,
+                        num_steps=settings.override_mean_recurrence,
+                    )
+                all_results["kv_cache"] = results
+                if settings._is_main_process:
+                    print0(f"\nKV-Cache CORE Results:")
+                    for strategy, r in results.items():
+                        print0(f"  {strategy}: CORE={r['core_metric']:.4f}")
+
+        elif task == "kv_cache_val":
+            val_data_dir = settings.tasks.kv_cache_val.val_data_dir
+            if not val_data_dir:
+                print0("WARNING: No val_data_dir specified for kv_cache_val task, skipping")
+                all_results["kv_cache_val"] = {}
+            elif settings.model_impl != "parcae":
+                print0("WARNING: kv_cache_val task only supports Parcae models, skipping")
+                all_results["kv_cache_val"] = {}
+            else:
+                print0(f"Loading validation data from: {val_data_dir}")
+                val_texts = load_val_texts_from_parquet(
+                    val_data_dir, max_files=settings.tasks.kv_cache_val.max_files,
+                )
+                print0(f"Loaded {len(val_texts)} validation texts")
+                kv_results = {}
+                partial_path = None
+                if settings.out_dir:
+                    partial_path = (
+                        Path(settings.out_dir)
+                        / "eval"
+                        / f"{settings.eval_name}.json"
+                    )
+                    if partial_path.exists():
+                        try:
+                            prior = json.loads(partial_path.read_text())
+                            kv_results.update(
+                                prior.get("kv_cache_val", {})
+                            )
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                for strategy in settings.tasks.kv_cache_val.strategies:
+                    if strategy in kv_results:
+                        print0(
+                            f"\nKV-Cache val loss: strategy={strategy} "
+                            "(already complete)"
+                        )
+                        continue
+                    print0(f"\nKV-Cache val loss: strategy={strategy}")
+                    if strategy == "full":
+                        # full + token-by-token is numerically equivalent to a single parallel
+                        # forward pass; skip the wrapper to avoid the N-fold slowdown.
+                        eval_module = model
+                    else:
+                        eval_module = KVCacheModelWrapper(
+                            model, lookup_strategy=strategy,
+                            num_steps=settings.override_mean_recurrence, mode="token_by_token",
+                        )
+                    r = run_val_loss(
+                        eval_module, tokenizer, settings, val_texts,
+                        max_samples=settings.tasks.kv_cache_val.max_samples,
+                    )
+                    kv_results[strategy] = {
+                        "loss": r.loss, "perplexity": r.perplexity,
+                        "bits_per_byte": r.bits_per_byte, "num_tokens": r.num_tokens,
+                    }
+                    if settings._is_main_process:
+                        print0(f"  {strategy}: loss={r.loss:.4f}  ppl={r.perplexity:.2f}  bpb={r.bits_per_byte:.4f}")
+                    if settings._is_main_process and partial_path is not None:
+                        partial_path.parent.mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
+                        tmp_path = partial_path.with_suffix(
+                            ".json.tmp"
+                        )
+                        tmp_path.write_text(
+                            json.dumps(
+                                {
+                                    **all_results,
+                                    "kv_cache_val": kv_results,
+                                },
+                                indent=2,
+                                default=str,
+                            )
+                        )
+                        tmp_path.replace(partial_path)
+                all_results["kv_cache_val"] = kv_results
+
         print0(f"Task {task} completed in {time.time() - t0:.2f}s")
 
     if settings._is_main_process and settings.out_dir:
@@ -302,7 +519,8 @@ def main():
             json.dump(all_results, f, indent=2, default=str)
         print0(f"\nResults saved to: {output_path}")
 
-    cleanup_distributed(settings)
+    if settings.eval_backend != "sglang":
+        cleanup_distributed(settings)
     print0("\nEvaluation complete.")
 
 

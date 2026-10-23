@@ -1,13 +1,12 @@
-run_name: parcae-small-140m
-resume: False
-# max_tokens: 11_200_000_000
+run_name: parcae-xlarge-1_3b
+resume: True
+token_to_param_ratio: 7.0
 seed: 42
-out_dir: "outputs/parcae-small-140m"
-model_name: parcae-small-140m
+out_dir: "outputs/parcae-xlarge-1_3b"
+model_name: parcae-xlarge-1_3b
 model_impl: dynamic
 block_size: 2048
 
-# Eval at different recurrence depths (8 is added automatically as mean_recurrence)
 partial_depth_eval: [1, 2, 4]
 
 model_overwrite:
@@ -15,17 +14,17 @@ model_overwrite:
   prelude_norm: true
 
 world_batch_size: 256
-micro_batch_size: 32
+micro_batch_size: 8
 
 optimizer: MuonAdamW
 optim_config:
-  lr: 8e-3
-  weight_decay: 0.0
+  lr: 6e-3
+  weight_decay: 0.1
   betas: [0.8, 0.95]
   eps: 1e-10
   muon_lr: 8e-3
   muon_momentum: 0.95
-  muon_wd: 0.2         # Muon weight decay (cautious, linearly decays to 0)
+  muon_wd: 0.3
   muon_ns_steps: 5
 
 warmup_steps: 0.0
@@ -42,19 +41,24 @@ fabric_strategy: ddp
 fabric_precision: bf16-mixed
 fabric:
   optim_sharding: False
+  bf16_grad_comm: True
 
 compile_model: True
-gradient_checkpointing: False
+compile_mode: max-autotune-no-cudagraphs
+gradient_checkpointing: True
+compiled_autograd: True
+dynamo_ddp_config: python_reducer
+inductor_shape_padding: True
 
-loss_guardrail_active: True
+loss_guardrail_active: False
 skip_nonfinite_grads: True
 allow_nonfinite_loss: False
 
 logger_project: "parcae"
 model_telemetry: True
 log_step_interval: 1
-save_step_interval: 1024
-eval_step_interval: 512
+save_step_interval: 4096
+eval_step_interval: 4096
 eval_iters: 16
 save_last_step: True
 
@@ -66,16 +70,15 @@ data_config:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/train"
+      data_dir: "/resource/data/climbmix-shuffle/400b"
       data_signature:
         keys: ["text"]
   val_data:
     - type: pqds-pure
       prefix: ""
       weight: 1
-      data_dir: "/resource/data/fineweb-edu-100b-shuffle/val"
+      data_dir: "/resource/data/climbmix-shuffle/val"
       data_signature:
         keys: ["text"]
 
-tokenizer_path: "/resource/tokenizer/parcae_tokenizer"
-
+tokenizer_path: "SandyResearch/parcae-climbmix-tokenizer"

@@ -8,6 +8,7 @@ import zipfile
 import tempfile
 import urllib.request
 import filelock
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from jinja2 import Template
 import torch
@@ -132,7 +133,9 @@ def batch_lm(tokenizer, prompts):
     return [t_with], [len(t_without)], [len(t_with)]
 
 @torch.no_grad()
-def forward_model(model, input_ids, device):
+def forward_model(model, input_ids, device, prefix_lengths=None):
+    if hasattr(model, "forward_tokens"):
+        return model.forward_tokens(input_ids, prefix_lengths=prefix_lengths)
     input_ids = input_ids.to(device)
     try:
         import inspect
@@ -207,7 +210,9 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta, max_seq_len
         tokens, starts, ends = new_tokens, new_starts, new_ends
     pad_id = get_pad_id(tokenizer)  # use pad token matching training (0 by default)
     input_ids = stack_sequences(tokens, pad_id)
-    losses, preds = forward_model(model, input_ids, device)
+    losses, preds = forward_model(
+        model, input_ids, device, prefix_lengths=starts,
+    )
     if task_type == 'language_modeling':
         si, ei = starts[0], ends[0]
         pred_toks = preds[0, si-1:ei-1]
@@ -217,15 +222,24 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta, max_seq_len
         mean_losses = [losses[i, s-1:e-1].mean().item() for i, (s, e) in enumerate(zip(starts, ends))]
         return mean_losses.index(min(mean_losses)) == item['gold']
 
+
 def evaluate_task(model, tokenizer, data, device, task_meta, max_seq_len=None, seed=1234):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
-    for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, max_seq_len, seed=seed)
+    indices = list(range(rank, len(data), world_size))
+    def evaluate(idx):
+        return evaluate_example(
+            idx, model, tokenizer, data, device, task_meta, max_seq_len, seed=seed
+        )
+    results = map(evaluate, indices)
+    if workers := getattr(model, "batch_size", None):
+        with ThreadPoolExecutor(workers) as executor:
+            results = list(executor.map(evaluate, indices))
+    for idx, is_correct in zip(indices, results):
         correct[idx] = float(is_correct)
     if world_size > 1:
-        dist.barrier()
+        dist.barrier(device_ids=[torch.device(device).index] if torch.device(device).type == "cuda" else None)
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     return correct.mean().item()
 

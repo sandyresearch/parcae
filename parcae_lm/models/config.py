@@ -44,6 +44,7 @@ class Config:
     # Main blocks
     block_class_name: str = "TransformerPreNormBlock"
     norm_class_name: str = "LayerNorm"
+    attention_class_name: str = "CausalSelfAttention"
 
     # Block details
     attn_impl: Literal["flash", "sdpa", "debug-skip"] = "flash"  # "flash" auto-selects FA3 on Hopper, SDPA elsewhere
@@ -55,10 +56,32 @@ class Config:
     init_strategy: str = "scaled"
     init_orthogonal: bool = False
     skip_initialization: bool = False
+    attention_nonlin_name: Optional[str] = None  # None: use nonlin_name
+
+    # MLA details
+    kv_lora_rank: Optional[int] = None
+    q_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+
+    # Kimi Delta Attention details
+    kda_mode: Literal["chunk"] = "chunk"
+    kda_impl: Literal["fla-chunk", "fla-custom-op"] = "fla-chunk"
+    kda_disable_recompute: bool = False  # passed to fla's chunk_kda
+    kda_head_dim: int = 128
+    kda_num_v_heads: Optional[int] = None
+    kda_expand_v: float = 1.0
+    kda_use_short_conv: bool = True
+    kda_allow_neg_eigval: bool = False
+    kda_safe_gate: bool = False
+    kda_lower_bound: Optional[float] = None
+    kda_conv_size: int = 4
+    kda_conv_bias: bool = False
 
     mup_model_scaling_factor: int = 1  # use this to scale model width+lr+logit_scale
 
-    use_fused_head: Literal["hhe", "cce", "full-triton", "pytorch"] = "pytorch"
+    use_fused_head: Literal["hhe", "cce", "full-triton", "liger", "pytorch"] = "pytorch"
 
     debias_attention: bool = False
     center_attention: bool = False
@@ -107,6 +130,14 @@ class Config:
         self.n_query_groups *= self.mup_model_scaling_factor
         self.num_key_value_heads *= self.mup_model_scaling_factor
         self.n_head *= self.mup_model_scaling_factor
+
+        # Assert MLA correctness if using
+        if self.is_mla:
+            required_attrs = ["qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim"]
+            for attr in required_attrs:
+                if getattr(self, attr) is None:
+                    raise ValueError(f"{attr} must be set when kv_lora_rank is not None (MLA enabled).")
+            self.head_size = self.v_head_dim
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -177,6 +208,36 @@ class Config:
         from parcae_lm.modules import blocks
 
         return getattr(blocks, self.block_class_name)
+
+    @property
+    def NonlinAttentionActivation(self) -> Callable:
+        if self.attention_nonlin_name is None:
+            return self.Nonlin()
+        if self.attention_nonlin_name == "GELU":
+            return torch.nn.functional.gelu
+        elif self.attention_nonlin_name == "TANH":
+            return torch.nn.functional.tanh
+        elif self.attention_nonlin_name == "ReLU2":
+            return Relu2()
+        elif self.attention_nonlin_name == "SiLU":
+            return torch.nn.functional.silu
+        elif self.attention_nonlin_name == "Identity":
+            return torch.nn.Identity()
+        raise ValueError(f"Could not identify attention_nonlin_name {self.attention_nonlin_name}")
+
+    @property
+    def is_mla(self) -> bool:
+        return self.kv_lora_rank is not None
+
+    @property
+    def qk_head_dim(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @property
+    def Attention(self) -> Type[torch.nn.Module]:
+        from parcae_lm.modules import mixer
+
+        return getattr(mixer, self.attention_class_name)
 
     @property
     def Nonlin(self) -> Type[torch.nn.Module]:

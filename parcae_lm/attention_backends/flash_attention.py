@@ -13,9 +13,33 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 from types import SimpleNamespace
+
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend  # type: ignore
+    _SDPA_KERNEL_AVAILABLE = True
+except Exception:
+    sdpa_kernel = None  # type: ignore
+    SDPBackend = None  # type: ignore
+    _SDPA_KERNEL_AVAILABLE = False
+
+
+def _force_cudnn() -> bool:
+    return os.environ.get("PARCAE_FORCE_CUDNN_SDPA", "0") not in ("0", "", "false", "False")
+
+
+def _sdpa_ctx():
+    if _force_cudnn() and _SDPA_KERNEL_AVAILABLE:
+        return sdpa_kernel([
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+        ])
+    return nullcontext()
 
 
 # =============================================================================
@@ -70,7 +94,8 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        with _sdpa_ctx():
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
     # Single token generation
     if Tq == 1:
@@ -79,20 +104,20 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             start = max(0, Tk - (window + 1))
             k = k[:, :, start:, :]
             v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        with _sdpa_ctx():
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
     # Need explicit mask for sliding window/chunk inference
     device = q.device
-    # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
     row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
     col_idx = torch.arange(Tk, device=device).unsqueeze(0)
     mask = col_idx <= row_idx
 
-    # sliding window (left)
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
-    
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+
+    with _sdpa_ctx():
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 
 # =============================================================================
